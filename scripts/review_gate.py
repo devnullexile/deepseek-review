@@ -109,8 +109,16 @@ def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
         return "head-changed"
     bot_reviews = [record for record in client.list_reviews()
                    if (record.get("user") or {}).get("login") == bot_login]
-    approvals = [record for record in bot_reviews if record.get("state") == "APPROVED"]
-    change_requests = [record for record in bot_reviews if record.get("state") == "CHANGES_REQUESTED"]
+    # GitHub lists reviews oldest first; the bot's current verdict is its latest active one.
+    verdicts = [record for record in bot_reviews
+                if record.get("state") in ("APPROVED", "CHANGES_REQUESTED")]
+    approvals = [record for record in verdicts if record["state"] == "APPROVED"]
+    change_requests = [record for record in verdicts if record["state"] == "CHANGES_REQUESTED"]
+    latest = verdicts[-1] if verdicts else None
+
+    def is_current(state):
+        return (latest is not None and latest.get("state") == state
+                and latest.get("commit_id") == head_sha_after)
 
     blockers = approval_blockers(review)
     if not blockers and excluded_patterns:
@@ -133,17 +141,18 @@ def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
         if not approve:
             withdraw(change_requests, f"Automated DeepSeek review found no blocking concerns in {short_sha}.")
             return "no-concerns"
-        if any(record.get("commit_id") == head_sha_after for record in approvals):
+        if is_current("APPROVED"):
             return "already-approved"
-        # A newer approval by the same reviewer supersedes its earlier change request.
         client.approve(head_sha_after, f"Automated DeepSeek review found no blocking concerns in {short_sha}.")
+        # Withdraw explicitly rather than rely on the approval superseding the request.
+        withdraw(change_requests, f"Automated DeepSeek review found no blocking concerns in {short_sha}.")
         return "approved"
 
     reasons = "; ".join(blockers)
     withdraw(approvals, f"Automated DeepSeek review of {short_sha} did not pass: {reasons}.")
     recommendation = _recommendation(review)
     if request_changes and recommendation == "changes_required":
-        if any(record.get("commit_id") == head_sha_after for record in change_requests):
+        if is_current("CHANGES_REQUESTED"):
             return "already-changes-requested"
         client.request_changes(head_sha_after,
                                f"Automated DeepSeek review recommends changes in {short_sha}: {reasons}. "

@@ -193,10 +193,20 @@ class SyncApprovalTests(unittest.TestCase):
         self.assertEqual(result, "not-approved")
         self.assertEqual([review_id for review_id, _ in client.dismissed], [2])
 
-    def test_clean_review_approval_supersedes_the_bots_change_request(self):
+    def test_clean_review_approves_and_withdraws_the_bots_change_request(self):
         client = FakeClient([review_record(1, BOT, "CHANGES_REQUESTED", OLD)])
         self.assertEqual(self.sync(client, clean_review(), request_changes=True), "approved")
-        self.assertEqual(client.dismissed, [])
+        self.assertEqual([review_id for review_id, _ in client.dismissed], [1])
+
+    def test_request_superseded_by_a_later_approval_is_posted_again(self):
+        # Reviews are listed oldest first; the approval on the same head is the current verdict.
+        client = FakeClient([review_record(1, BOT, "CHANGES_REQUESTED", HEAD),
+                             review_record(2, BOT, "APPROVED", HEAD)])
+        result = self.sync(client, clean_review(merge_recommendation="changes_required"),
+                           request_changes=True)
+        self.assertEqual(result, "changes-requested")
+        self.assertEqual([sha for sha, _ in client.requested], [HEAD])
+        self.assertIn(2, [review_id for review_id, _ in client.dismissed])
 
     def test_approval_disabled_never_approves_but_still_requests_changes(self):
         client = FakeClient()
