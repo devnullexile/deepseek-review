@@ -18,7 +18,7 @@ COMMAND_ENV = {
     "gate": {"ALLOWED_AUTHORS", "IGNORE_GLOBS"},
     "head-sha": {"GH_TOKEN", "PR_NUMBER"},
     "approve": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN", "HEAD_SHA_BEFORE", "REVIEW_JSON",
-                "APPROVAL_EXCLUDED_PATHS"},
+                "APPROVAL_EXCLUDED_PATHS", "APPROVE", "REQUEST_CHANGES"},
 }
 
 

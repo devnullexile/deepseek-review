@@ -27,3 +27,4 @@ jobs:
           app-private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
           # This repository holds the approval rules, so a person approves changes to them too.
           approval-excluded-paths: .github/*, action.yml, scripts/*
+          request-changes: "true"

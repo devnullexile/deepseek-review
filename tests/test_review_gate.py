@@ -36,6 +36,7 @@ class FakeClient:
         self.changed_files = len(self.files) if changed_files is None else changed_files
         self.file_requests = 0
         self.approved = []
+        self.requested = []
         self.dismissed = []
 
     def list_reviews(self):
@@ -50,6 +51,9 @@ class FakeClient:
 
     def approve(self, commit_sha, body):
         self.approved.append((commit_sha, body))
+
+    def request_changes(self, commit_sha, body):
+        self.requested.append((commit_sha, body))
 
     def dismiss(self, review_id, message):
         self.dismissed.append((review_id, message))
@@ -147,10 +151,77 @@ class PathBlockerTests(unittest.TestCase):
 
 
 class SyncApprovalTests(unittest.TestCase):
-    def sync(self, client, review, before=HEAD, after=HEAD, excluded=()):
+    def sync(self, client, review, before=HEAD, after=HEAD, excluded=(), **options):
         return review_gate.sync_approval(
             client, bot_login=BOT, head_sha_before=before, head_sha_after=after, review=review,
-            excluded_patterns=excluded)
+            excluded_patterns=excluded, **options)
+
+    def test_changes_required_requests_changes_when_enabled(self):
+        client = FakeClient([review_record(1, BOT, "APPROVED", OLD)])
+        result = self.sync(client, clean_review(merge_recommendation="changes_required"),
+                           request_changes=True)
+        self.assertEqual(result, "changes-requested")
+        self.assertEqual([sha for sha, _ in client.requested], [HEAD])
+        self.assertIn("changes_required", client.requested[0][1])
+        self.assertEqual([review_id for review_id, _ in client.dismissed], [1])
+
+    def test_changes_are_not_requested_twice_for_the_same_commit(self):
+        client = FakeClient([review_record(1, BOT, "CHANGES_REQUESTED", HEAD)])
+        result = self.sync(client, clean_review(merge_recommendation="changes_required"),
+                           request_changes=True)
+        self.assertEqual(result, "already-changes-requested")
+        self.assertEqual((client.requested, client.dismissed), ([], []))
+
+    def test_changes_are_not_requested_by_default(self):
+        client = FakeClient()
+        result = self.sync(client, clean_review(merge_recommendation="changes_required"))
+        self.assertEqual(result, "not-approved")
+        self.assertEqual(client.requested, [])
+
+    def test_softer_verdict_withdraws_the_bots_change_request(self):
+        client = FakeClient([review_record(1, BOT, "CHANGES_REQUESTED", OLD),
+                             review_record(2, "alice", "CHANGES_REQUESTED", OLD)])
+        result = self.sync(client, clean_review(merge_recommendation="needs_review"),
+                           request_changes=True)
+        self.assertEqual(result, "not-approved")
+        self.assertEqual([review_id for review_id, _ in client.dismissed], [1])
+
+    def test_changes_required_keeps_an_existing_request_when_the_option_is_off(self):
+        client = FakeClient([review_record(1, BOT, "CHANGES_REQUESTED", OLD)])
+        result = self.sync(client, clean_review(merge_recommendation="changes_required"))
+        self.assertEqual(result, "not-approved")
+        self.assertEqual((client.requested, client.dismissed), ([], []))
+
+    def test_failed_review_keeps_the_bots_change_request(self):
+        client = FakeClient([review_record(1, BOT, "CHANGES_REQUESTED", OLD),
+                             review_record(2, BOT, "APPROVED", OLD)])
+        result = self.sync(client, None, request_changes=True)
+        self.assertEqual(result, "not-approved")
+        self.assertEqual([review_id for review_id, _ in client.dismissed], [2])
+
+    def test_clean_review_approves_and_withdraws_the_bots_change_request(self):
+        client = FakeClient([review_record(1, BOT, "CHANGES_REQUESTED", OLD)])
+        self.assertEqual(self.sync(client, clean_review(), request_changes=True), "approved")
+        self.assertEqual([review_id for review_id, _ in client.dismissed], [1])
+
+    def test_request_superseded_by_a_later_approval_is_posted_again(self):
+        # Reviews are listed oldest first; the approval on the same head is the current verdict.
+        client = FakeClient([review_record(1, BOT, "CHANGES_REQUESTED", HEAD),
+                             review_record(2, BOT, "APPROVED", HEAD)])
+        result = self.sync(client, clean_review(merge_recommendation="changes_required"),
+                           request_changes=True)
+        self.assertEqual(result, "changes-requested")
+        self.assertEqual([sha for sha, _ in client.requested], [HEAD])
+        self.assertIn(2, [review_id for review_id, _ in client.dismissed])
+
+    def test_approval_disabled_never_approves_but_still_requests_changes(self):
+        client = FakeClient()
+        self.assertEqual(self.sync(client, clean_review(), approve=False, request_changes=True),
+                         "no-concerns")
+        self.assertEqual(client.approved, [])
+        result = self.sync(client, clean_review(merge_recommendation="changes_required"),
+                           approve=False, request_changes=True)
+        self.assertEqual(result, "changes-requested")
 
     def test_clean_review_of_a_protected_path_withdraws_instead_of_approving(self):
         client = FakeClient([review_record(1, BOT, "APPROVED", OLD)],

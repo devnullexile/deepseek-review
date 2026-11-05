@@ -26,6 +26,13 @@ inputs:
     description: Approve when the review is complete and reports no concerns; withdraw the bot's approval otherwise.
     required: false
     default: "true"
+  request-changes:
+    description: >-
+      Request changes when the model's merge recommendation is changes_required, and withdraw
+      that request once a later completed review no longer requires changes. With branch
+      protection this blocks merging until the bot approves or a person dismisses the request.
+    required: false
+    default: "false"
   approval-excluded-paths:
     description: >-
       Comma- or newline-separated file globs that the bot never approves, so a person approves
@@ -78,7 +85,9 @@ outputs:
     description: "\"true\" when the pull request passed the author gate and was reviewed."
     value: ${{ steps.gate.outputs.run }}
   approval:
-    description: "approved, already-approved, not-approved, head-changed, or empty when approval is disabled."
+    description: >-
+      approved, already-approved, changes-requested, already-changes-requested, no-concerns,
+      not-approved, head-changed, or empty when both approve and request-changes are disabled.
     value: ${{ steps.approval.outputs.result }}
 
 runs:
@@ -182,10 +191,10 @@ runs:
           --pr_url "$PR_URL" --json-output /out/review.json review
 
     # Also runs when the review failed: without review output, an earlier approval is withdrawn.
-    - name: Approve or withdraw approval
+    - name: Approve or request changes
       id: approval
       if: >-
-        !cancelled() && inputs.approve == 'true' &&
+        !cancelled() && (inputs.approve == 'true' || inputs.request-changes == 'true') &&
         steps.gate.outputs.run == 'true' && steps.head.outcome == 'success'
       shell: bash
       env:
@@ -195,4 +204,6 @@ runs:
         HEAD_SHA_BEFORE: ${{ steps.head.outputs.sha }}
         REVIEW_JSON: ${{ runner.temp }}/deepseek-review/review.json
         APPROVAL_EXCLUDED_PATHS: ${{ inputs.approval-excluded-paths }}
+        APPROVE: ${{ inputs.approve }}
+        REQUEST_CHANGES: ${{ inputs.request-changes }}
       run: python3 "$GITHUB_ACTION_PATH/scripts/review_gate.py" approve
