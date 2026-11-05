@@ -26,6 +26,8 @@ def author_allowed(pull_request, allowed_authors, is_member=None):
     login = (pull_request.get("user") or {}).get("login", "")
     allowed = {name.strip().lower() for name in allowed_authors if name.strip()}
     if is_member is not None:
+        if not login:
+            return False, "pull request author is unknown (deleted account)"
         if login.lower() in allowed:
             return True, f"{login} is in allowed-authors"
         if is_member(login):
@@ -209,7 +211,8 @@ class GitHubClient:
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 body = response.read()
-                return (json.loads(body) if body else None), response.headers.get("Link", "")
+                return ((json.loads(body) if body else None), response.headers.get("Link", ""),
+                        response.status)
         except urllib.error.HTTPError as error:
             detail = error.read().decode(errors="replace")[:500]
             raise GitHubError(f"{method} {url} failed with HTTP {error.code}: {detail}",
@@ -217,7 +220,7 @@ class GitHubClient:
 
     def is_org_member(self, org, login):
         try:
-            self._request("GET", f"/orgs/{org}/members/{login}")
+            _, _, status = self._request("GET", f"/orgs/{org}/members/{login}")
         except GitHubError as error:
             if error.status == 404:
                 return False
@@ -227,20 +230,21 @@ class GitHubClient:
                     "the organization permission Members: Read-only and accept it in the "
                     f"installation settings. ({error})", status=403) from error
             raise
-        return True
+        # Only 204 means "is a member"; anything else, such as a listing, does not.
+        return status == 204
 
     def head_sha(self):
-        pull, _ = self._request("GET", self.pull_path)
+        pull, _, _ = self._request("GET", self.pull_path)
         return pull["head"]["sha"]
 
     def changed_file_count(self):
-        pull, _ = self._request("GET", self.pull_path)
+        pull, _, _ = self._request("GET", self.pull_path)
         return pull["changed_files"]
 
     def _paginate(self, url):
         items = []
         while url:
-            page, link = self._request("GET", url)
+            page, link, _ = self._request("GET", url)
             items.extend(page)
             match = _NEXT_LINK_RE.search(link)
             url = match.group(1) if match else None
@@ -314,10 +318,17 @@ def command_gate():
         owner = (event.get("repository") or {}).get("owner") or {}
         if owner.get("type") != "Organization":
             raise SystemExit("members-only needs a repository owned by an organization.")
+        token = os.environ.get("GH_TOKEN", "")
         client = GitHubClient(os.environ.get("GITHUB_API_URL", "https://api.github.com"),
-                              os.environ["GH_TOKEN"], os.environ["GITHUB_REPOSITORY"],
-                              pull_request["number"])
-        is_member = lambda login: client.is_org_member(owner["login"], login)  # noqa: E731
+                              token, os.environ["GITHUB_REPOSITORY"], pull_request["number"])
+
+        def is_member(login):
+            if not token:
+                raise SystemExit(
+                    "members-only has no reviewer token: if the token step failed, grant the reviewer "
+                    "GitHub App the organization permission Members: Read-only and accept it in the "
+                    "installation settings.")
+            return client.is_org_member(owner["login"], login)
     allowed, reason = author_allowed(pull_request, allowed_authors, is_member=is_member)
     print(f"{'Reviewing' if allowed else 'Skipping review'}: {reason}")
     if allowed:

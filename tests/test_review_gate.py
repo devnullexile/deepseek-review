@@ -113,6 +113,15 @@ class AuthorAllowedTests(unittest.TestCase):
         allowed, _ = review_gate.author_allowed(pull_request(draft=True), [], is_member=fail)
         self.assertFalse(allowed)
 
+    def test_members_only_refuses_an_unknown_author_without_asking_github(self):
+        def fail(login):
+            raise AssertionError("membership must not be checked for an empty login")
+        pr = pull_request()
+        pr["user"] = None  # deleted account
+        allowed, reason = review_gate.author_allowed(pr, [], is_member=fail)
+        self.assertFalse(allowed)
+        self.assertIn("unknown", reason)
+
     def test_draft_pull_requests_are_skipped(self):
         allowed, reason = review_gate.author_allowed(pull_request(draft=True), [])
         self.assertFalse(allowed)

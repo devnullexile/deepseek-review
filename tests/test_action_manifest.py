@@ -64,6 +64,12 @@ class ActionManifestTests(unittest.TestCase):
         ids = [step.get("id") for step in self.steps]
         self.assertLess(ids.index("token"), ids.index("gate"))
 
+    def test_gate_runs_even_when_the_token_step_was_skipped_or_failed(self):
+        # Drafts and a missing app permission must still reach the gate's own handling.
+        [gate] = [step for step in self.steps if step.get("id") == "gate"]
+        self.assertIn("!cancelled()", gate.get("if", ""))
+        self.assertNotIn("steps.token", gate.get("if", ""))
+
     def test_every_input_reference_is_declared(self):
         declared = set(self.manifest["inputs"])
         used = set(re.findall(r"inputs\.([\w-]+)", MANIFEST.read_text()))

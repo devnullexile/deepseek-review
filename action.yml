@@ -117,7 +117,8 @@ runs:
 
     - name: Check pull request author
       id: gate
-      if: steps.token.outcome == 'success'
+      # Runs after a skipped (draft) or failed token step too, so it can report why.
+      if: ${{ !cancelled() }}
       shell: bash
       env:
         ALLOWED_AUTHORS: ${{ inputs.allowed-authors }}
