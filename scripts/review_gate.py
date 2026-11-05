@@ -81,7 +81,7 @@ def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review)
     ]
     blockers = approval_blockers(review)
     short_sha = head_sha_after[:7]
-    if not blockers:
+    if blockers:
         if any(record.get("commit_id") == head_sha_after for record in bot_approvals):
             return "already-approved"
         client.approve(head_sha_after,
