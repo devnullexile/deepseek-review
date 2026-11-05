@@ -48,6 +48,7 @@ inputs:
     description: >-
       Output token limit per model call, including the model's thinking. deepseek-flash thinks
       by default and allows up to 384K output tokens; a low limit can leave no room for the answer.
+      Lower it when you choose a model with a smaller output limit.
     required: false
     default: "384000"
   response-language:
@@ -79,6 +80,7 @@ runs:
       shell: bash
       env:
         ALLOWED_AUTHORS: ${{ inputs.allowed-authors }}
+      IGNORE_GLOBS: ${{ inputs.ignore-globs }}
       run: python3 "$GITHUB_ACTION_PATH/scripts/review_gate.py" gate
 
     - name: Create reviewer token

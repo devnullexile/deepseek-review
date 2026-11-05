@@ -93,7 +93,7 @@ jobs:
 | `ignore-globs` | пусто | JSON-массив масок файлов, которые не проверять, например `'["*.meta", "*.unity"]'`; такие файлы не ревьюятся и не мешают approve |
 | `model` | `deepseek/deepseek-flash` | Имя модели в LiteLLM; это DeepSeek-V4.1-Flash |
 | `max-model-tokens` | `128000` | Бюджет входных токенов на один вызов модели |
-| `max-output-tokens` | `384000` | Лимит выходных токенов на вызов, включая размышления модели |
+| `max-output-tokens` | `384000` | Лимит выходных токенов на вызов, включая размышления модели; уменьшите для моделей с меньшим лимитом |
 | `response-language` | `en-US` | Язык ревью |
 | `max-findings` | `5` | Максимум замечаний |
 | `pr-agent-image` | `pragent/pr-agent:0.49.0` | Образ pr-agent; шаг approve зависит от формата его `--json-output` |
