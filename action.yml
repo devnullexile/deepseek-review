@@ -224,6 +224,21 @@ runs:
             GITHUB__*|DEEPSEEK__*|CONFIG__*|PR_REVIEWER__*|IGNORE__*) env_args+=(-e "$name") ;;
           esac
         done
+        # Python 3 is already required by the gate and approval steps.
+        review_readable() {
+          python3 - "$1" <<'PY'
+        import json, sys
+        try:
+            with open(sys.argv[1], encoding="utf-8") as handle:
+                json.load(handle)
+        except FileNotFoundError:
+            print("review.json is missing.")
+            sys.exit(1)
+        except (OSError, ValueError) as error:
+            print(f"review.json is not readable: {error}")
+            sys.exit(1)
+        PY
+        }
         # A dropped API connection or an empty model reply fails one attempt, not the whole review.
         # Each attempt starts without output, so a stale or partial review.json is never used.
         attempt=1
@@ -232,7 +247,7 @@ runs:
           if docker run --rm --entrypoint /usr/local/bin/pr-agent \
                -v "$out:/out" "${env_args[@]}" "$PR_AGENT_IMAGE" \
                --pr_url "$PR_URL" --json-output /out/review.json review &&
-             python3 -c 'import json, sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$out/review.json" 2>/dev/null; then
+             review_readable "$out/review.json"; then
             echo "Review finished on attempt $attempt of $REVIEW_ATTEMPTS."
             exit 0
           fi

@@ -101,6 +101,13 @@ class ReviewStepTests(unittest.TestCase):
         self.assertEqual(self.call_count, 2)
         self.assertEqual(self.review(), GOOD)
 
+    def test_the_log_says_why_an_attempt_was_rejected(self):
+        unreadable = self.run_step(["badjson", "ok"])
+        self.assertIn("review.json is not readable", unreadable.stdout)
+        self.calls.unlink()
+        missing = self.run_step(["nojson", "ok"])
+        self.assertIn("review.json is missing", missing.stdout)
+
     def test_the_step_fails_after_its_last_attempt(self):
         result = self.run_step(["fail", "fail", "fail"], attempts="2")
         self.assertNotEqual(result.returncode, 0)
