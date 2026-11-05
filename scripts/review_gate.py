@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 
 WRITER_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
-NEGATIVE_SECURITY_ANSWERS = frozenset({"", "no", "no.", "none", "none."})
+NEGATIVE_SECURITY_ANSWERS = frozenset({"no", "none", "false"})
 
 
 def author_allowed(pull_request, allowed_authors):
@@ -28,10 +28,11 @@ def author_allowed(pull_request, allowed_authors):
 
 
 def _security_concern(value):
-    if value is None:
+    # Same rule as pr-agent's is_value_no(), so approval agrees with the posted comment.
+    # A bare YAML `No` answer arrives as False.
+    if not value:
         return False
-    text = str(value).strip().lower()
-    return not (text in NEGATIVE_SECURITY_ANSWERS or text.startswith("no "))
+    return str(value).strip().lower() not in NEGATIVE_SECURITY_ANSWERS
 
 
 def approval_blockers(output):

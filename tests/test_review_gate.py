@@ -98,10 +98,13 @@ class ApprovalBlockerTests(unittest.TestCase):
         self.assertTrue(review_gate.approval_blockers(review))
 
     def test_security_concerns_block_but_negative_answers_do_not(self):
-        for value in ("No", "no", "None", "No security concerns identified", "", None):
+        # Mirrors pr-agent's is_value_no(); YAML parses a bare `No` answer as False.
+        for value in ("No", "no\n", "None", "false", False, "", None):
             with self.subTest(value=value):
                 self.assertEqual(review_gate.approval_blockers(clean_review(security_concerns=value)), [])
-        for value in ("Not escaped: SQL injection in query()", "Token is logged"):
+        # pr-agent renders these as "Security concerns", so the bot must not approve them.
+        for value in ("No security concerns identified", "Not escaped: SQL injection in query()",
+                      "Token is logged", True):
             with self.subTest(value=value):
                 self.assertTrue(review_gate.approval_blockers(clean_review(security_concerns=value)))
 

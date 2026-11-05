@@ -31,13 +31,19 @@ inputs:
     required: false
     default: ""
   model:
-    description: LiteLLM model name.
+    description: LiteLLM model name. deepseek/deepseek-flash is DeepSeek-V4.1-Flash on the official DeepSeek API.
     required: false
     default: deepseek/deepseek-flash
   max-model-tokens:
     description: Input token budget per model call.
     required: false
     default: "128000"
+  max-output-tokens:
+    description: >-
+      Output token limit per model call, including the model's thinking. deepseek-flash thinks
+      by default; a low limit can leave no room for the answer.
+    required: false
+    default: "65536"
   response-language:
     description: Locale of the review text.
     required: false
@@ -106,7 +112,7 @@ runs:
         CONFIG__FALLBACK_MODELS: "[]"
         CONFIG__CUSTOM_MODEL_MAX_TOKENS: "1000000"
         CONFIG__MAX_MODEL_TOKENS: ${{ inputs.max-model-tokens }}
-        CONFIG__MAX_OUTPUT_TOKENS: "16384"
+        CONFIG__MAX_OUTPUT_TOKENS: ${{ inputs.max-output-tokens }}
         CONFIG__RESPONSE_LANGUAGE: ${{ inputs.response-language }}
         CONFIG__USE_REPO_SETTINGS_FILE: "false"
         CONFIG__USE_GLOBAL_SETTINGS_FILE: "false"
