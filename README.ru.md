@@ -90,9 +90,10 @@ jobs:
 | `allowed-authors` | пусто | Логины для ревью; если пусто — владельцы, члены организации и коллабораторы |
 | `approve` | `true` | Ставить approve чистым ревью и снимать устаревшие approve бота |
 | `extra-instructions` | пусто | Правила проекта, которые добавляются к общей политике ревью |
+| `ignore-globs` | пусто | JSON-массив масок файлов, которые не проверять, например `'["*.meta", "*.unity"]'`; такие файлы не ревьюятся и не мешают approve |
 | `model` | `deepseek/deepseek-flash` | Имя модели в LiteLLM; это DeepSeek-V4.1-Flash |
 | `max-model-tokens` | `128000` | Бюджет входных токенов на один вызов модели |
-| `max-output-tokens` | `65536` | Лимит выходных токенов на вызов, включая размышления модели |
+| `max-output-tokens` | `384000` | Лимит выходных токенов на вызов, включая размышления модели; уменьшите для моделей с меньшим лимитом |
 | `response-language` | `en-US` | Язык ревью |
 | `max-findings` | `5` | Максимум замечаний |
 | `pr-agent-image` | `pragent/pr-agent:0.49.0` | Образ pr-agent; шаг approve зависит от формата его `--json-output` |
@@ -108,5 +109,7 @@ jobs:
 ```sh
 python3 -m unittest discover -s tests -v
 ```
+
+Контрактным тестам `action.yml` нужен PyYAML; без него они пропускаются.
 
 Логика approve находится в `scripts/review_gate.py` и использует только стандартную библиотеку Python.

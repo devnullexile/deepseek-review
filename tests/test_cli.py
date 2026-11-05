@@ -130,6 +130,29 @@ class GateCommandTests(CliTestCase):
         self.assertEqual(self.outputs(), {"run": "false"})
         self.assertIn("stranger", result.stdout)
 
+    def test_valid_ignore_globs_are_accepted(self):
+        event = self.write_event({"pull_request": {
+            "number": 7, "html_url": "u", "draft": False,
+            "user": {"login": "alice"}, "author_association": "OWNER"}})
+        for globs in ("", '["*.meta", "docs/*/evidence/*"]', "[]"):
+            with self.subTest(globs=globs):
+                result = self.run_cli("gate", GITHUB_EVENT_PATH=event, ALLOWED_AUTHORS="",
+                                      IGNORE_GLOBS=globs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_malformed_ignore_globs_fail_before_any_review(self):
+        event = self.write_event({"pull_request": {
+            "number": 7, "html_url": "u", "draft": False,
+            "user": {"login": "alice"}, "author_association": "OWNER"}})
+        for globs in ("*.meta", '{"glob": "*.meta"}', '["*.meta", 3]', '["*.meta",'):
+            with self.subTest(globs=globs):
+                self.output.write_text("")
+                result = self.run_cli("gate", GITHUB_EVENT_PATH=event, ALLOWED_AUTHORS="",
+                                      IGNORE_GLOBS=globs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("ignore-globs", result.stdout + result.stderr)
+                self.assertEqual(self.outputs(), {})
+
     def test_non_pull_request_event_fails(self):
         event = self.write_event({"push": {}})
         result = self.run_cli("gate", GITHUB_EVENT_PATH=event, ALLOWED_AUTHORS="")

@@ -173,7 +173,19 @@ def _load_review(path):
         return None
 
 
+def _validate_ignore_globs(text):
+    if not text.strip():
+        return
+    try:
+        globs = json.loads(text)
+    except ValueError as error:
+        raise SystemExit(f"ignore-globs must be a JSON array of strings: {error}") from error
+    if not isinstance(globs, list) or not all(isinstance(glob, str) for glob in globs):
+        raise SystemExit("ignore-globs must be a JSON array of strings, for example '[\"*.meta\"]'.")
+
+
 def command_gate():
+    _validate_ignore_globs(os.environ.get("IGNORE_GLOBS", ""))
     with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as handle:
         event = json.load(handle)
     pull_request = event.get("pull_request")
