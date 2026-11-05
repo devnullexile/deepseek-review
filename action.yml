@@ -41,14 +41,16 @@ inputs:
     required: false
     default: deepseek/deepseek-flash
   max-model-tokens:
-    description: Input token budget per model call.
+    description: >-
+      Token window per model call. pr-agent reserves max-output-tokens inside it, so the prompt
+      gets the remainder: 512000 - 384000 = 128000 input tokens by default.
     required: false
-    default: "128000"
+    default: "512000"
   max-output-tokens:
     description: >-
       Output token limit per model call, including the model's thinking. deepseek-flash thinks
       by default and allows up to 384K output tokens; a low limit can leave no room for the answer.
-      Lower it when you choose a model with a smaller output limit.
+      Lower it, together with max-model-tokens, when you choose a model with a smaller output limit.
     required: false
     default: "384000"
   response-language:
