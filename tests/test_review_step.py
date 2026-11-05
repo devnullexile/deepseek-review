@@ -126,7 +126,7 @@ class ReviewStepTests(unittest.TestCase):
         self.assertEqual(self.call_count, 1)
 
     def test_an_invalid_attempt_count_is_refused_before_any_review(self):
-        for attempts in ("0", "two", ""):
+        for attempts in ("0", "00", "000", "two", ""):
             with self.subTest(attempts=attempts):
                 self.calls.unlink(missing_ok=True)
                 result = self.run_step(["ok"], attempts=attempts)

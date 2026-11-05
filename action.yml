@@ -209,9 +209,14 @@ runs:
         if [ -n "$IGNORE_GLOBS" ]; then
           export IGNORE__GLOB="$IGNORE_GLOBS"
         fi
+        # A digits-only check alone would let 00 through; test compares decimal, so 08 is eight.
         case "$REVIEW_ATTEMPTS" in
-          ''|*[!0-9]*|0) echo "::error::review-attempts must be a positive integer, not '$REVIEW_ATTEMPTS'."; exit 2 ;;
+          ''|*[!0-9]*) echo "::error::review-attempts must be a positive integer, not '$REVIEW_ATTEMPTS'."; exit 2 ;;
         esac
+        if [ "$REVIEW_ATTEMPTS" -eq 0 ]; then
+          echo "::error::review-attempts must be a positive integer, not '$REVIEW_ATTEMPTS'."
+          exit 2
+        fi
         case "$RETRY_DELAY_SECONDS" in
           ''|*[!0-9]*) echo "::error::retry-delay-seconds must be a whole number of seconds, not '$RETRY_DELAY_SECONDS'."; exit 2 ;;
         esac
