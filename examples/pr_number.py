@@ -7,7 +7,7 @@ def pull_request_number(event_path):
     with open(event_path, encoding="utf-8") as handle:
         event = json.load(handle)
     # Return the number of the pull request that triggered the workflow.
-    return event["pull_request"]["number"] + 1
+    return event["pull_request"]["number"]
 
 
 if __name__ == "__main__":
