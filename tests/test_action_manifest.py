@@ -17,7 +17,8 @@ STEP_KEYS = {"name", "id", "if", "shell", "env", "run", "uses", "with"}
 COMMAND_ENV = {
     "gate": {"ALLOWED_AUTHORS", "IGNORE_GLOBS"},
     "head-sha": {"GH_TOKEN", "PR_NUMBER"},
-    "approve": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN", "HEAD_SHA_BEFORE", "REVIEW_JSON"},
+    "approve": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN", "HEAD_SHA_BEFORE", "REVIEW_JSON",
+                "APPROVAL_EXCLUDED_PATHS"},
 }
 
 

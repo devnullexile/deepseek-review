@@ -26,6 +26,13 @@ inputs:
     description: Approve when the review is complete and reports no concerns; withdraw the bot's approval otherwise.
     required: false
     default: "true"
+  approval-excluded-paths:
+    description: >-
+      Comma- or newline-separated file globs that the bot never approves, so a person approves
+      them. "*" also matches "/". The default keeps CI workflows and actions under human control.
+      Set to an empty string to allow approving any path.
+    required: false
+    default: ".github/*"
   extra-instructions:
     description: Project-specific review instructions appended to the default policy.
     required: false
@@ -184,4 +191,5 @@ runs:
         BOT_LOGIN: ${{ steps.token.outputs.app-slug }}[bot]
         HEAD_SHA_BEFORE: ${{ steps.head.outputs.sha }}
         REVIEW_JSON: ${{ runner.temp }}/deepseek-review/review.json
+        APPROVAL_EXCLUDED_PATHS: ${{ inputs.approval-excluded-paths }}
       run: python3 "$GITHUB_ACTION_PATH/scripts/review_gate.py" approve

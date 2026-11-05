@@ -22,9 +22,10 @@ CLEAN = {
 class FakeGitHub:
     """Minimal in-memory GitHub REST API for one pull request."""
 
-    def __init__(self, head_sha, reviews):
+    def __init__(self, head_sha, reviews, files=()):
         self.head_sha = head_sha
         self.reviews = reviews
+        self.files = list(files)
         self.requests = []
         fake = self
 
@@ -47,6 +48,8 @@ class FakeGitHub:
 
             def do_GET(self):
                 fake.requests.append(("GET", self.path, None, self.headers.get("Authorization")))
+                if self.path.startswith("/repos/o/r/pulls/7/files"):
+                    return self._send(200, fake.files)
                 if self.path == "/repos/o/r/pulls/7":
                     return self._send(200, {"head": {"sha": fake.head_sha}})
                 if self.path.startswith("/repos/o/r/pulls/7/reviews"):
@@ -165,8 +168,8 @@ class ApiCommandTests(CliTestCase):
         return {"GITHUB_API_URL": fake.url, "GITHUB_REPOSITORY": "o/r", "PR_NUMBER": "7",
                 "GH_TOKEN": "secret-token", **extra}
 
-    def start(self, head_sha=HEAD, reviews=()):
-        fake = FakeGitHub(head_sha, list(reviews))
+    def start(self, head_sha=HEAD, reviews=(), files=()):
+        fake = FakeGitHub(head_sha, list(reviews), files)
         self.addCleanup(fake.close)
         return fake
 
@@ -206,6 +209,16 @@ class ApiCommandTests(CliTestCase):
         self.assertEqual(body["event"], "DISMISS")
         self.assertIn("changes_required", body["message"])
         self.assertIn("changes_required", result.stdout)
+
+    def test_excluded_paths_from_the_environment_prevent_approval(self):
+        fake = self.start(files=[{"filename": "src/app.py"}, {"filename": ".github/workflows/x.yml"}])
+        result = self.run_cli("approve", **self.api_env(
+            fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=self.write_review(CLEAN),
+            APPROVAL_EXCLUDED_PATHS=".github/*\n"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs(), {"result": "not-approved"})
+        self.assertEqual(fake.writes(), [])
+        self.assertIn(".github/workflows/x.yml", result.stdout)
 
     def test_missing_review_file_never_approves(self):
         fake = self.start()
