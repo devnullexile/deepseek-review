@@ -158,8 +158,9 @@ def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
                                f"Automated DeepSeek review recommends changes in {short_sha}: {reasons}. "
                                "See the review comments for details.")
         return "changes-requested"
-    if recommendation is not None:
-        # A completed review that does not require changes; a failed one keeps the request.
+    if recommendation not in (None, "changes_required"):
+        # A completed review with a softer verdict. A failed review, or one that still requires
+        # changes while request_changes is off, keeps the existing request.
         withdraw(change_requests, f"Automated DeepSeek review of {short_sha} no longer requires changes.")
     return "not-approved"
 

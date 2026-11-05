@@ -186,6 +186,12 @@ class SyncApprovalTests(unittest.TestCase):
         self.assertEqual(result, "not-approved")
         self.assertEqual([review_id for review_id, _ in client.dismissed], [1])
 
+    def test_changes_required_keeps_an_existing_request_when_the_option_is_off(self):
+        client = FakeClient([review_record(1, BOT, "CHANGES_REQUESTED", OLD)])
+        result = self.sync(client, clean_review(merge_recommendation="changes_required"))
+        self.assertEqual(result, "not-approved")
+        self.assertEqual((client.requested, client.dismissed), ([], []))
+
     def test_failed_review_keeps_the_bots_change_request(self):
         client = FakeClient([review_record(1, BOT, "CHANGES_REQUESTED", OLD),
                              review_record(2, BOT, "APPROVED", OLD)])
