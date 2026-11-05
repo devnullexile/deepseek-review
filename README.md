@@ -8,7 +8,7 @@ A GitHub Action that reviews pull requests with [pr-agent](https://github.com/qo
 
 1. Skips draft pull requests and authors you do not trust (see [Who gets reviewed](#who-gets-reviewed)).
 2. Creates a short-lived token for the reviewer GitHub App. The token is limited to the current repository.
-3. Runs pr-agent in a container. It reads the diff through the GitHub API and posts a summary comment and inline findings. Pull request code is never checked out or executed.
+3. Runs pr-agent in a container. It reads the diff through the GitHub API and posts a summary comment and inline findings. Pull request code is never checked out or executed. If an attempt fails or writes no readable review, for example after the DeepSeek API drops a connection, the review runs again, up to `review-attempts` times. If every attempt fails, the step fails.
 4. Approves the pull request when all of these hold:
    - the merge recommendation is `no_concerns_found`;
    - no key issues and no security concerns were reported;
@@ -104,6 +104,9 @@ To review only members of the organization that owns the repository, set `member
 | `response-language` | `en-US` | Review language |
 | `max-findings` | `5` | Maximum number of findings |
 | `pr-agent-image` | `pragent/pr-agent:0.49.0` | pr-agent image; the approval step relies on its `--json-output` format |
+| `review-attempts` | `2` | Attempts when a review fails or writes no readable review; `1` disables retries. Each attempt can call the model again |
+| `retry-delay-seconds` | `30` | Wait before retrying a failed attempt |
+| `fallback-models` | `[]` | JSON array of models pr-agent tries, in order, when the main model fails within an attempt; empty means none |
 
 Outputs: `reviewed` (`true` when reviewed) and `approval` (`approved`, `already-approved`, `changes-requested`, `already-changes-requested`, `no-concerns`, `not-approved`, `head-changed`).
 
