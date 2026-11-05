@@ -30,13 +30,23 @@ def pull_request(login="alice", association="OWNER", draft=False):
 
 
 class FakeClient:
-    def __init__(self, reviews=()):
+    def __init__(self, reviews=(), files=(), changed_files=None):
         self.reviews = list(reviews)
+        self.files = list(files)
+        self.changed_files = len(self.files) if changed_files is None else changed_files
+        self.file_requests = 0
         self.approved = []
         self.dismissed = []
 
     def list_reviews(self):
         return list(self.reviews)
+
+    def list_files(self):
+        self.file_requests += 1
+        return list(self.files)
+
+    def changed_file_count(self):
+        return self.changed_files
 
     def approve(self, commit_sha, body):
         self.approved.append((commit_sha, body))
@@ -119,10 +129,48 @@ class ApprovalBlockerTests(unittest.TestCase):
         self.assertTrue(review_gate.approval_blockers(review))
 
 
+class PathBlockerTests(unittest.TestCase):
+    def test_matching_files_block_and_are_named(self):
+        files = [{"filename": "src/app.py"}, {"filename": ".github/workflows/ci.yml"}]
+        blockers = review_gate.path_blockers(files, [".github/*"])
+        self.assertEqual(len(blockers), 1)
+        self.assertIn(".github/workflows/ci.yml", blockers[0])
+
+    def test_renames_out_of_a_protected_path_also_block(self):
+        files = [{"filename": "old-ci.yml", "previous_filename": ".github/workflows/ci.yml"}]
+        self.assertTrue(review_gate.path_blockers(files, [".github/*"]))
+
+    def test_no_patterns_or_no_matches_do_not_block(self):
+        files = [{"filename": "src/app.py"}, {"filename": "docs/github.md"}]
+        self.assertEqual(review_gate.path_blockers(files, []), [])
+        self.assertEqual(review_gate.path_blockers(files, [".github/*"]), [])
+
+
 class SyncApprovalTests(unittest.TestCase):
-    def sync(self, client, review, before=HEAD, after=HEAD):
+    def sync(self, client, review, before=HEAD, after=HEAD, excluded=()):
         return review_gate.sync_approval(
-            client, bot_login=BOT, head_sha_before=before, head_sha_after=after, review=review)
+            client, bot_login=BOT, head_sha_before=before, head_sha_after=after, review=review,
+            excluded_patterns=excluded)
+
+    def test_clean_review_of_a_protected_path_withdraws_instead_of_approving(self):
+        client = FakeClient([review_record(1, BOT, "APPROVED", OLD)],
+                            files=[{"filename": ".github/workflows/review.yml"}])
+        result = self.sync(client, clean_review(), excluded=[".github/*"])
+        self.assertEqual(result, "not-approved")
+        self.assertEqual(client.approved, [])
+        self.assertEqual([review_id for review_id, _ in client.dismissed], [1])
+        self.assertIn(".github/workflows/review.yml", client.dismissed[0][1])
+
+    def test_truncated_file_list_never_approves_when_paths_are_protected(self):
+        # GitHub lists at most 3000 files; a protected file could be among the missing ones.
+        client = FakeClient(files=[{"filename": "src/app.py"}], changed_files=3001)
+        result = self.sync(client, clean_review(), excluded=[".github/*"])
+        self.assertEqual(result, "not-approved")
+        self.assertEqual(client.approved, [])
+
+    def test_clean_review_outside_protected_paths_is_approved(self):
+        client = FakeClient(files=[{"filename": "src/app.py"}])
+        self.assertEqual(self.sync(client, clean_review(), excluded=[".github/*"]), "approved")
 
     def test_clean_review_approves_the_reviewed_commit(self):
         client = FakeClient()

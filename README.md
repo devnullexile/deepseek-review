@@ -13,6 +13,7 @@ A GitHub Action that reviews pull requests with [pr-agent](https://github.com/qo
    - the merge recommendation is `no_concerns_found`;
    - no key issues and no security concerns were reported;
    - every changed file was fully reviewed;
+   - no changed file matches `approval-excluded-paths` (by default `.github/*`, so a person approves CI changes);
    - the head commit did not change while the review ran.
 
    The approval is pinned to the reviewed commit. In any other case, the bot withdraws (dismisses) its own earlier approvals. A failed review also withdraws them. Reviews by people are never touched.
@@ -89,6 +90,7 @@ By default, the action reviews pull requests whose authors are repository owners
 | `app-private-key` | required | Reviewer GitHub App private key |
 | `allowed-authors` | empty | Logins to review; empty means owners, members and collaborators |
 | `approve` | `true` | Approve clean reviews and withdraw stale bot approvals |
+| `approval-excluded-paths` | `.github/*` | Globs the bot never approves; a person must. `*` also matches `/`. Empty allows any path |
 | `extra-instructions` | empty | Project rules appended to the default review policy |
 | `ignore-globs` | empty | JSON array of globs to skip, e.g. `'["*.meta", "*.unity"]'`; skipped files are not reviewed and do not block approval |
 | `model` | `deepseek/deepseek-flash` | LiteLLM model name; this is DeepSeek-V4.1-Flash |

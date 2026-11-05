@@ -17,7 +17,8 @@ STEP_KEYS = {"name", "id", "if", "shell", "env", "run", "uses", "with"}
 COMMAND_ENV = {
     "gate": {"ALLOWED_AUTHORS", "IGNORE_GLOBS"},
     "head-sha": {"GH_TOKEN", "PR_NUMBER"},
-    "approve": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN", "HEAD_SHA_BEFORE", "REVIEW_JSON"},
+    "approve": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN", "HEAD_SHA_BEFORE", "REVIEW_JSON",
+                "APPROVAL_EXCLUDED_PATHS"},
 }
 
 
@@ -50,6 +51,14 @@ class ActionManifestTests(unittest.TestCase):
         window = int(inputs["max-model-tokens"]["default"])
         output = int(inputs["max-output-tokens"]["default"])
         self.assertGreaterEqual(window - output, 100_000)
+
+    def test_pr_agent_knows_the_bot_login_it_posts_as(self):
+        # An installation token cannot call GET /user; without this, pr-agent assumes it is
+        # github-actions[bot], fails to recognize its own comments, and posts a new summary
+        # comment on every run instead of updating one.
+        [review_step] = [step for step in self.steps if "docker run" in step.get("run", "")]
+        login = review_step["env"].get("GITHUB__AGENT_LOGIN", "")
+        self.assertEqual(login, "${{ steps.token.outputs.app-slug }}[bot]")
 
     def test_every_input_reference_is_declared(self):
         declared = set(self.manifest["inputs"])

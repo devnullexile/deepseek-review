@@ -1,5 +1,6 @@
 """Gate and approval logic for the DeepSeek pull request review action."""
 
+import fnmatch
 import json
 import os
 import re
@@ -9,6 +10,8 @@ import urllib.request
 
 WRITER_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 NEGATIVE_SECURITY_ANSWERS = frozenset({"no", "none", "false"})
+# Used when APPROVAL_EXCLUDED_PATHS is unset; only an explicitly empty value approves any path.
+DEFAULT_EXCLUDED_PATHS = ".github/*"
 
 
 def author_allowed(pull_request, allowed_authors):
@@ -72,8 +75,26 @@ def approval_blockers(output):
     return blockers
 
 
-def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review):
-    """Approve a clean review of an unchanged head, or withdraw the bot's approvals."""
+def path_blockers(files, patterns):
+    """Block approval of changes to paths that need a human, such as CI workflows."""
+    matched = []
+    for changed in files:
+        for name in (changed.get("filename"), changed.get("previous_filename")):
+            if name and any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns):
+                matched.append(name)
+                break
+    if not matched:
+        return []
+    shown = ", ".join(matched[:3]) + (f" and {len(matched) - 3} more" if len(matched) > 3 else "")
+    return [f"changes to {shown} need a human approval"]
+
+
+def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
+                  excluded_patterns=(), report=lambda blocker: None):
+    """Approve a clean review of an unchanged head, or withdraw the bot's approvals.
+
+    report() receives each reason that prevents approval.
+    """
     if not head_sha_before or head_sha_before != head_sha_after:
         return "head-changed"
     bot_approvals = [
@@ -81,6 +102,16 @@ def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review)
         if (record.get("user") or {}).get("login") == bot_login and record.get("state") == "APPROVED"
     ]
     blockers = approval_blockers(review)
+    if not blockers and excluded_patterns:
+        files = client.list_files()
+        expected = client.changed_file_count()
+        if len(files) < expected:
+            # GitHub lists at most 3000 files; an unlisted file could match a protected path.
+            blockers = [f"only {len(files)} of {expected} changed files could be listed"]
+        else:
+            blockers = path_blockers(files, excluded_patterns)
+    for blocker in blockers:
+        report(blocker)
     short_sha = head_sha_after[:7]
     if not blockers:
         if any(record.get("commit_id") == head_sha_after for record in bot_approvals):
@@ -134,14 +165,24 @@ class GitHubClient:
         pull, _ = self._request("GET", self.pull_path)
         return pull["head"]["sha"]
 
-    def list_reviews(self):
-        reviews, url = [], f"{self.pull_path}/reviews?per_page=100"
+    def changed_file_count(self):
+        pull, _ = self._request("GET", self.pull_path)
+        return pull["changed_files"]
+
+    def _paginate(self, url):
+        items = []
         while url:
             page, link = self._request("GET", url)
-            reviews.extend(page)
+            items.extend(page)
             match = _NEXT_LINK_RE.search(link)
             url = match.group(1) if match else None
-        return reviews
+        return items
+
+    def list_reviews(self):
+        return self._paginate(f"{self.pull_path}/reviews?per_page=100")
+
+    def list_files(self):
+        return self._paginate(f"{self.pull_path}/files?per_page=100")
 
     def approve(self, commit_sha, body):
         self._request("POST", f"{self.pull_path}/reviews",
@@ -173,6 +214,10 @@ def _load_review(path):
         return None
 
 
+def _split_list(text):
+    return [item.strip() for item in re.split(r"[,\n]", text) if item.strip()]
+
+
 def _validate_ignore_globs(text):
     if not text.strip():
         return
@@ -191,7 +236,7 @@ def command_gate():
     pull_request = event.get("pull_request")
     if not isinstance(pull_request, dict):
         raise SystemExit("This action must run on a pull_request or pull_request_target event.")
-    allowed_authors = re.split(r"[,\n]", os.environ.get("ALLOWED_AUTHORS", ""))
+    allowed_authors = _split_list(os.environ.get("ALLOWED_AUTHORS", ""))
     allowed, reason = author_allowed(pull_request, allowed_authors)
     print(f"{'Reviewing' if allowed else 'Skipping review'}: {reason}")
     if allowed:
@@ -208,11 +253,12 @@ def command_head_sha():
 def command_approve():
     client = _client_from_env()
     review = _load_review(os.environ["REVIEW_JSON"])
-    for blocker in approval_blockers(review):
-        print(f"Not approving: {blocker}")
     result = sync_approval(client, bot_login=os.environ["BOT_LOGIN"],
                            head_sha_before=os.environ.get("HEAD_SHA_BEFORE", ""),
-                           head_sha_after=client.head_sha(), review=review)
+                           head_sha_after=client.head_sha(), review=review,
+                           excluded_patterns=_split_list(
+                               os.environ.get("APPROVAL_EXCLUDED_PATHS", DEFAULT_EXCLUDED_PATHS)),
+                           report=lambda blocker: print(f"Not approving: {blocker}"))
     print(f"Approval result: {result}")
     _set_outputs(result=result)
 
