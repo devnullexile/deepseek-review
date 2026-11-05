@@ -114,6 +114,12 @@ class ReviewStepTests(unittest.TestCase):
         self.assertEqual(self.call_count, 2)
         self.assertFalse((self.dir / "deepseek-review" / "review.json").exists())
 
+    def test_a_leading_zero_count_is_read_as_decimal_and_still_stops(self):
+        # test's -ge compares decimal integers, so "08" is eight attempts, not an octal error that never stops.
+        result = self.run_step(["fail"] * 12, attempts="08")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.call_count, 8)
+
     def test_one_attempt_means_no_retry(self):
         result = self.run_step(["fail", "ok"], attempts="1")
         self.assertNotEqual(result.returncode, 0)
