@@ -89,18 +89,29 @@ def path_blockers(files, patterns):
     return [f"changes to {shown} need a human approval"]
 
 
-def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
-                  excluded_patterns=(), report=lambda blocker: None):
-    """Approve a clean review of an unchanged head, or withdraw the bot's approvals.
+def _recommendation(output):
+    """The merge recommendation of a parsed review, or None when the review is unusable."""
+    if not isinstance(output, dict) or not isinstance(output.get("review"), dict):
+        return None
+    return output["review"].get("merge_recommendation")
 
-    report() receives each reason that prevents approval.
+
+def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
+                  excluded_patterns=(), approve=True, request_changes=False,
+                  report=lambda blocker: None):
+    """Bring the bot's own review state in line with the latest review of an unchanged head.
+
+    Approves a clean review (when approve is set), requests changes when the model says
+    changes are required (when request_changes is set), and withdraws the bot's earlier
+    verdicts that no longer hold. report() receives each reason that prevents approval.
     """
     if not head_sha_before or head_sha_before != head_sha_after:
         return "head-changed"
-    bot_approvals = [
-        record for record in client.list_reviews()
-        if (record.get("user") or {}).get("login") == bot_login and record.get("state") == "APPROVED"
-    ]
+    bot_reviews = [record for record in client.list_reviews()
+                   if (record.get("user") or {}).get("login") == bot_login]
+    approvals = [record for record in bot_reviews if record.get("state") == "APPROVED"]
+    change_requests = [record for record in bot_reviews if record.get("state") == "CHANGES_REQUESTED"]
+
     blockers = approval_blockers(review)
     if not blockers and excluded_patterns:
         files = client.list_files()
@@ -113,15 +124,34 @@ def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
     for blocker in blockers:
         report(blocker)
     short_sha = head_sha_after[:7]
+
+    def withdraw(records, message):
+        for record in records:
+            client.dismiss(record["id"], message)
+
     if not blockers:
-        if any(record.get("commit_id") == head_sha_after for record in bot_approvals):
+        if not approve:
+            withdraw(change_requests, f"Automated DeepSeek review found no blocking concerns in {short_sha}.")
+            return "no-concerns"
+        if any(record.get("commit_id") == head_sha_after for record in approvals):
             return "already-approved"
-        client.approve(head_sha_after,
-                       f"Automated DeepSeek review found no blocking concerns in {short_sha}.")
+        # A newer approval by the same reviewer supersedes its earlier change request.
+        client.approve(head_sha_after, f"Automated DeepSeek review found no blocking concerns in {short_sha}.")
         return "approved"
+
     reasons = "; ".join(blockers)
-    for record in bot_approvals:
-        client.dismiss(record["id"], f"Automated DeepSeek review of {short_sha} did not pass: {reasons}.")
+    withdraw(approvals, f"Automated DeepSeek review of {short_sha} did not pass: {reasons}.")
+    recommendation = _recommendation(review)
+    if request_changes and recommendation == "changes_required":
+        if any(record.get("commit_id") == head_sha_after for record in change_requests):
+            return "already-changes-requested"
+        client.request_changes(head_sha_after,
+                               f"Automated DeepSeek review recommends changes in {short_sha}: {reasons}. "
+                               "See the review comments for details.")
+        return "changes-requested"
+    if recommendation is not None:
+        # A completed review that does not require changes; a failed one keeps the request.
+        withdraw(change_requests, f"Automated DeepSeek review of {short_sha} no longer requires changes.")
     return "not-approved"
 
 
@@ -187,6 +217,10 @@ class GitHubClient:
     def approve(self, commit_sha, body):
         self._request("POST", f"{self.pull_path}/reviews",
                       {"commit_id": commit_sha, "event": "APPROVE", "body": body})
+
+    def request_changes(self, commit_sha, body):
+        self._request("POST", f"{self.pull_path}/reviews",
+                      {"commit_id": commit_sha, "event": "REQUEST_CHANGES", "body": body})
 
     def dismiss(self, review_id, message):
         self._request("PUT", f"{self.pull_path}/reviews/{review_id}/dismissals",
@@ -258,6 +292,8 @@ def command_approve():
                            head_sha_after=client.head_sha(), review=review,
                            excluded_patterns=_split_list(
                                os.environ.get("APPROVAL_EXCLUDED_PATHS", DEFAULT_EXCLUDED_PATHS)),
+                           approve=os.environ.get("APPROVE", "true") == "true",
+                           request_changes=os.environ.get("REQUEST_CHANGES", "false") == "true",
                            report=lambda blocker: print(f"Not approving: {blocker}"))
     print(f"Approval result: {result}")
     _set_outputs(result=result)

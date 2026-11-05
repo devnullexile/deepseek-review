@@ -236,6 +236,19 @@ class ApiCommandTests(CliTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.outputs(), {"result": "approved"})
 
+    def test_request_changes_flag_posts_a_change_request(self):
+        fake = self.start(files=[{"filename": "src/app.py"}])
+        blocked = {**CLEAN, "review": {**CLEAN["review"], "merge_recommendation": "changes_required"}}
+        result = self.run_cli("approve", **self.api_env(
+            fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=self.write_review(blocked),
+            APPROVE="true", REQUEST_CHANGES="true"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs(), {"result": "changes-requested"})
+        [(method, path, body)] = fake.writes()
+        self.assertEqual((method, path), ("POST", "/repos/o/r/pulls/7/reviews"))
+        self.assertEqual((body["event"], body["commit_id"]), ("REQUEST_CHANGES", HEAD))
+        self.assertTrue(body["body"])
+
     def test_missing_review_file_never_approves(self):
         fake = self.start()
         result = self.run_cli("approve", **self.api_env(

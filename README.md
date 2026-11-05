@@ -17,6 +17,7 @@ A GitHub Action that reviews pull requests with [pr-agent](https://github.com/qo
    - the head commit did not change while the review ran.
 
    The approval is pinned to the reviewed commit. In any other case, the bot withdraws (dismisses) its own earlier approvals. A failed review also withdraws them. Reviews by people are never touched.
+5. Optionally (`request-changes: "true"`), requests changes when the model's verdict is `changes_required`. A later approval by the bot supersedes the request. A later completed review with a softer verdict withdraws it. A failed review keeps it, so a merge that the request blocks stays blocked.
 
 The approval is a signal, not a guarantee. A language model can miss defects, and the text of a pull request can try to manipulate it. Keep human review for anything that matters.
 
@@ -89,6 +90,7 @@ By default, the action reviews pull requests whose authors are repository owners
 | `app-id` or `client-id` | one required | Reviewer GitHub App identifier |
 | `app-private-key` | required | Reviewer GitHub App private key |
 | `allowed-authors` | empty | Logins to review; empty means owners, members and collaborators |
+| `request-changes` | `false` | Request changes on a `changes_required` verdict; useful with branch protection |
 | `approve` | `true` | Approve clean reviews and withdraw stale bot approvals |
 | `approval-excluded-paths` | `.github/*` | Globs the bot never approves; a person must. `*` also matches `/`. Empty allows any path |
 | `extra-instructions` | empty | Project rules appended to the default review policy |
@@ -100,7 +102,7 @@ By default, the action reviews pull requests whose authors are repository owners
 | `max-findings` | `5` | Maximum number of findings |
 | `pr-agent-image` | `pragent/pr-agent:0.49.0` | pr-agent image; the approval step relies on its `--json-output` format |
 
-Outputs: `reviewed` (`true` when reviewed) and `approval` (`approved`, `already-approved`, `not-approved`, `head-changed`).
+Outputs: `reviewed` (`true` when reviewed) and `approval` (`approved`, `already-approved`, `changes-requested`, `already-changes-requested`, `no-concerns`, `not-approved`, `head-changed`).
 
 ## Versions
 
