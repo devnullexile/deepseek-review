@@ -28,7 +28,7 @@ Approve бота — это сигнал, а не гарантия. Модель
 1. Откройте **Settings → Developer settings → GitHub Apps → New GitHub App**.
 2. Задайте имя и логотип. В разделе **Webhook** снимите галочку **Active**.
 3. В **Repository permissions** выставьте **Contents: Read-only**, **Issues: Read and write** и **Pull requests: Read and write**.
-4. Создайте приложение. Запишите его **App ID** и сгенерируйте **private key**.
+4. Создайте приложение. Запишите его **Client ID** (начинается с `Iv`) и сгенерируйте **private key**.
 5. Чтобы пользоваться приложением в организации, включите **Advanced → Make public** и установите его на организацию. Приватный ключ при этом не раскрывается.
 
 ### Для каждого репозитория
@@ -37,7 +37,7 @@ Approve бота — это сигнал, а не гарантия. Модель
 2. В **Settings → Secrets and variables → Actions** добавьте:
    - секрет `DEEPSEEK_API_KEY`;
    - секрет `REVIEW_APP_PRIVATE_KEY`: PEM-файл целиком;
-   - переменную `REVIEW_APP_ID`.
+   - переменную `REVIEW_CLIENT_ID`.
 
    В организации на платном тарифе или для публичных репозиториев их можно задать один раз на уровне организации. На GitHub Free приватные репозитории не видят секреты организации.
 3. Добавьте файл `.github/workflows/deepseek-review.yml`:
@@ -63,7 +63,7 @@ jobs:
       - uses: devnullexile/deepseek-review@v1
         with:
           deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
-          app-id: ${{ vars.REVIEW_APP_ID }}
+          client-id: ${{ vars.REVIEW_CLIENT_ID }}
           app-private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
           # Необязательно:
           # allowed-authors: alice, bob
@@ -89,7 +89,8 @@ jobs:
 | Параметр | По умолчанию | Значение |
 |---|---|---|
 | `deepseek-api-key` | обязателен | Ключ DeepSeek API |
-| `app-id` или `client-id` | нужен один | Идентификатор GitHub App ревьюера |
+| `client-id` | обязателен | Client ID приложения GitHub App ревьюера; подходит и числовой App ID |
+| `app-id` | пусто | Устарел: числовой App ID, используется, если `client-id` пуст. Используйте `client-id` |
 | `app-private-key` | обязателен | Приватный ключ GitHub App ревьюера |
 | `allowed-authors` | пусто | Логины для ревью; если пусто — владельцы, члены организации и коллабораторы |
 | `request-changes` | `false` | Ставить «request changes» при вердикте `changes_required`; полезно вместе с защитой веток |

@@ -70,6 +70,16 @@ class ActionManifestTests(unittest.TestCase):
         self.assertIn("!cancelled()", gate.get("if", ""))
         self.assertNotIn("steps.token", gate.get("if", ""))
 
+    def test_the_token_step_passes_only_client_id_so_no_deprecation_warning_appears(self):
+        # create-github-app-token deprecates app-id; the runner warns whenever it appears in `with`,
+        # even empty. Its code reads client-id or app-id into the same field, so an App ID works too.
+        [token] = [step for step in self.steps if step.get("id") == "token"]
+        self.assertNotIn("app-id", token["with"])
+        self.assertEqual(token["with"]["client-id"], "${{ inputs.client-id || inputs.app-id }}")
+
+    def test_our_app_id_input_is_deprecated_in_favour_of_client_id(self):
+        self.assertIn("client-id", self.manifest["inputs"]["app-id"].get("deprecationMessage", ""))
+
     def test_every_input_reference_is_declared(self):
         declared = set(self.manifest["inputs"])
         used = set(re.findall(r"inputs\.([\w-]+)", MANIFEST.read_text()))

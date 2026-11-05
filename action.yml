@@ -6,11 +6,12 @@ inputs:
     description: DeepSeek API key.
     required: true
   app-id:
-    description: Numeric ID of the reviewer GitHub App. Give app-id or client-id.
+    description: Numeric ID of the reviewer GitHub App. Deprecated; use client-id, which also accepts this ID.
     required: false
     default: ""
+    deprecationMessage: Use client-id instead. It accepts the app's Client ID, or its numeric App ID.
   client-id:
-    description: Client ID of the reviewer GitHub App. Give app-id or client-id.
+    description: Client ID of the reviewer GitHub App, such as Iv23li..., or its numeric App ID.
     required: false
     default: ""
   app-private-key:
@@ -124,8 +125,9 @@ runs:
       if: github.event.pull_request.draft == false
       uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
       with:
-        app-id: ${{ inputs.app-id }}
-        client-id: ${{ inputs.client-id }}
+        # Only client-id is passed: the token action deprecates app-id and warns whenever it is given,
+        # even empty. It reads client-id or app-id into the same field, so an App ID works here too.
+        client-id: ${{ inputs.client-id || inputs.app-id }}
         private-key: ${{ inputs.app-private-key }}
         permission-contents: read
         permission-issues: write

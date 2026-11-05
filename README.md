@@ -28,7 +28,7 @@ The approval is a signal, not a guarantee. A language model can miss defects, an
 1. Go to **Settings → Developer settings → GitHub Apps → New GitHub App**.
 2. Give it a name and logo. Disable **Webhook → Active**.
 3. Under **Repository permissions**, set **Contents: Read-only**, **Issues: Read and write** and **Pull requests: Read and write**.
-4. Create the app. Note its **App ID** and generate a **private key**.
+4. Create the app. Note its **Client ID** (it starts with `Iv`) and generate a **private key**.
 5. To use the app in an organization, open **Advanced → Make public** and install the app on the organization. A public app does not expose your private key.
 
 ### Per repository
@@ -37,7 +37,7 @@ The approval is a signal, not a guarantee. A language model can miss defects, an
 2. Add these Actions settings under **Settings → Secrets and variables → Actions**:
    - secret `DEEPSEEK_API_KEY`;
    - secret `REVIEW_APP_PRIVATE_KEY`: the whole PEM file;
-   - variable `REVIEW_APP_ID`.
+   - variable `REVIEW_CLIENT_ID`.
 
    In an organization on a paid plan, or for public repositories, you can define them once at the organization level. On GitHub Free, organization secrets are not available to private repositories.
 3. Add `.github/workflows/deepseek-review.yml`:
@@ -63,7 +63,7 @@ jobs:
       - uses: devnullexile/deepseek-review@v1
         with:
           deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
-          app-id: ${{ vars.REVIEW_APP_ID }}
+          client-id: ${{ vars.REVIEW_CLIENT_ID }}
           app-private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
           # Optional:
           # allowed-authors: alice, bob
@@ -89,7 +89,8 @@ To review only members of the organization that owns the repository, set `member
 | Input | Default | Meaning |
 |---|---|---|
 | `deepseek-api-key` | required | DeepSeek API key |
-| `app-id` or `client-id` | one required | Reviewer GitHub App identifier |
+| `client-id` | required | Reviewer GitHub App Client ID; the numeric App ID also works |
+| `app-id` | empty | Deprecated: the numeric App ID, used when `client-id` is empty. Use `client-id` instead |
 | `app-private-key` | required | Reviewer GitHub App private key |
 | `allowed-authors` | empty | Logins to review; empty means owners, members and collaborators |
 | `request-changes` | `false` | Request changes on a `changes_required` verdict; useful with branch protection |
