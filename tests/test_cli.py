@@ -22,10 +22,11 @@ CLEAN = {
 class FakeGitHub:
     """Minimal in-memory GitHub REST API for one pull request."""
 
-    def __init__(self, head_sha, reviews, files=()):
+    def __init__(self, head_sha, reviews, files=(), members=()):
         self.head_sha = head_sha
         self.reviews = reviews
         self.files = list(files)
+        self.members = None if members is None else set(members)
         self.requests = []
         fake = self
 
@@ -48,6 +49,17 @@ class FakeGitHub:
 
             def do_GET(self):
                 fake.requests.append(("GET", self.path, None, self.headers.get("Authorization")))
+                if self.path == "/orgs/o/members/":
+                    return self._send(200, [{"login": "alice"}])  # the list endpoint
+                if self.path.startswith("/orgs/o/members/"):
+                    login = self.path.rsplit("/", 1)[1]
+                    if fake.members is None:
+                        return self._send(403, {"message": "Resource not accessible by integration"})
+                    if login in fake.members:
+                        self.send_response(204)
+                        self.end_headers()
+                        return
+                    return self._send(404, {"message": "Not Found"})
                 if self.path.startswith("/repos/o/r/pulls/7/files"):
                     return self._send(200, fake.files)
                 if self.path == "/repos/o/r/pulls/7":
@@ -169,8 +181,8 @@ class ApiCommandTests(CliTestCase):
         return {"GITHUB_API_URL": fake.url, "GITHUB_REPOSITORY": "o/r", "PR_NUMBER": "7",
                 "GH_TOKEN": "secret-token", **extra}
 
-    def start(self, head_sha=HEAD, reviews=(), files=()):
-        fake = FakeGitHub(head_sha, list(reviews), files)
+    def start(self, head_sha=HEAD, reviews=(), files=(), members=()):
+        fake = FakeGitHub(head_sha, list(reviews), files, members)
         self.addCleanup(fake.close)
         return fake
 
@@ -178,6 +190,61 @@ class ApiCommandTests(CliTestCase):
         path = self.tmp / "review.json"
         path.write_text(json.dumps(payload))
         return str(path)
+
+    def members_only_gate(self, fake, login, owner_type="Organization", draft=False, **env):
+        event = self.tmp / "event.json"
+        event.write_text(json.dumps({
+            "repository": {"owner": {"login": "o", "type": owner_type}},
+            "pull_request": {"number": 7, "html_url": "u", "draft": draft,
+                             "user": {"login": login} if login is not None else None,
+                             "author_association": "CONTRIBUTOR"}}))
+        return self.run_cli("gate", **{**self.api_env(
+            fake, GITHUB_EVENT_PATH=str(event), ALLOWED_AUTHORS="", MEMBERS_ONLY="true"), **env})
+
+    def test_members_only_gate_skips_a_deleted_author(self):
+        fake = self.start(members={"alice"})
+        result = self.members_only_gate(fake, None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs(), {"run": "false"})
+
+    def test_members_only_gate_without_a_token_explains_the_permission(self):
+        # create-github-app-token fails when the app lacks Members: Read-only; the gate still runs.
+        fake = self.start(members={"alice"})
+        result = self.members_only_gate(fake, "alice", GH_TOKEN="")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Members", result.stdout + result.stderr)
+
+    def test_members_only_gate_skips_drafts_without_a_token(self):
+        fake = self.start(members={"alice"})
+        result = self.members_only_gate(fake, "alice", draft=True, GH_TOKEN="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs(), {"run": "false"})
+
+    def test_members_only_gate_asks_github_about_private_membership(self):
+        fake = self.start(members={"alice"})
+        result = self.members_only_gate(fake, "alice")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["run"], "true")
+        self.assertIn(("GET", "/orgs/o/members/alice"), [(m, p) for m, p, _, _ in fake.requests])
+
+    def test_members_only_gate_skips_non_members(self):
+        fake = self.start(members={"alice"})
+        result = self.members_only_gate(fake, "mallory")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs(), {"run": "false"})
+        self.assertIn("mallory", result.stdout)
+
+    def test_members_only_gate_explains_a_missing_app_permission(self):
+        fake = self.start(members=None)
+        result = self.members_only_gate(fake, "alice")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Members", result.stdout + result.stderr)
+
+    def test_members_only_gate_requires_an_organization(self):
+        fake = self.start(members={"alice"})
+        result = self.members_only_gate(fake, "alice", owner_type="User")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("organization", result.stdout + result.stderr)
 
     def test_head_sha_command_records_the_current_head(self):
         fake = self.start()

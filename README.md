@@ -80,7 +80,9 @@ The action needs a Linux runner with Docker and Python 3. GitHub-hosted `ubuntu-
 
 ## Who gets reviewed
 
-By default, the action reviews pull requests whose authors are repository owners, organization members or collaborators. Each review costs DeepSeek tokens, so strangers cannot spend your key. To list exact logins instead, set `allowed-authors`. GitHub may report private organization members as `CONTRIBUTOR`; list them explicitly if that happens.
+By default, the action reviews pull requests whose authors are repository owners, organization members or collaborators. Each review costs DeepSeek tokens, so strangers cannot spend your key. To list exact logins instead, set `allowed-authors`. GitHub may report private organization members as `CONTRIBUTOR`, so the association rule can miss them.
+
+To review only members of the organization that owns the repository, set `members-only: "true"`. Membership is then checked through the GitHub API, so private members count and outside collaborators do not. Logins in `allowed-authors` are reviewed too. This needs the organization permission **Members: Read-only** on the reviewer app: add it under the app's **Permissions & events**, then accept the new permission in the organization's installation settings.
 
 ## Inputs
 
@@ -91,6 +93,7 @@ By default, the action reviews pull requests whose authors are repository owners
 | `app-private-key` | required | Reviewer GitHub App private key |
 | `allowed-authors` | empty | Logins to review; empty means owners, members and collaborators |
 | `request-changes` | `false` | Request changes on a `changes_required` verdict; useful with branch protection |
+| `members-only` | `false` | Review only members of the owning organization (needs Members: Read-only) |
 | `approve` | `true` | Approve clean reviews and withdraw stale bot approvals |
 | `approval-excluded-paths` | `.github/*` | Globs the bot never approves; a person must. `*` also matches `/`. Empty allows any path |
 | `extra-instructions` | empty | Project rules appended to the default review policy |
