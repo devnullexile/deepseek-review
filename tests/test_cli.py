@@ -51,7 +51,8 @@ class FakeGitHub:
                 if self.path.startswith("/repos/o/r/pulls/7/files"):
                     return self._send(200, fake.files)
                 if self.path == "/repos/o/r/pulls/7":
-                    return self._send(200, {"head": {"sha": fake.head_sha}})
+                    return self._send(200, {"head": {"sha": fake.head_sha},
+                                            "changed_files": len(fake.files)})
                 if self.path.startswith("/repos/o/r/pulls/7/reviews"):
                     page = 2 if "page=2" in self.path else 1
                     half = len(fake.reviews) // 2

@@ -30,9 +30,10 @@ def pull_request(login="alice", association="OWNER", draft=False):
 
 
 class FakeClient:
-    def __init__(self, reviews=(), files=()):
+    def __init__(self, reviews=(), files=(), changed_files=None):
         self.reviews = list(reviews)
         self.files = list(files)
+        self.changed_files = len(self.files) if changed_files is None else changed_files
         self.file_requests = 0
         self.approved = []
         self.dismissed = []
@@ -43,6 +44,9 @@ class FakeClient:
     def list_files(self):
         self.file_requests += 1
         return list(self.files)
+
+    def changed_file_count(self):
+        return self.changed_files
 
     def approve(self, commit_sha, body):
         self.approved.append((commit_sha, body))
@@ -156,6 +160,13 @@ class SyncApprovalTests(unittest.TestCase):
         self.assertEqual(client.approved, [])
         self.assertEqual([review_id for review_id, _ in client.dismissed], [1])
         self.assertIn(".github/workflows/review.yml", client.dismissed[0][1])
+
+    def test_truncated_file_list_never_approves_when_paths_are_protected(self):
+        # GitHub lists at most 3000 files; a protected file could be among the missing ones.
+        client = FakeClient(files=[{"filename": "src/app.py"}], changed_files=3001)
+        result = self.sync(client, clean_review(), excluded=[".github/*"])
+        self.assertEqual(result, "not-approved")
+        self.assertEqual(client.approved, [])
 
     def test_clean_review_outside_protected_paths_is_approved(self):
         client = FakeClient(files=[{"filename": "src/app.py"}])

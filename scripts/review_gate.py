@@ -101,7 +101,13 @@ def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
     ]
     blockers = approval_blockers(review)
     if not blockers and excluded_patterns:
-        blockers = path_blockers(client.list_files(), excluded_patterns)
+        files = client.list_files()
+        expected = client.changed_file_count()
+        if len(files) < expected:
+            # GitHub lists at most 3000 files; an unlisted file could match a protected path.
+            blockers = [f"only {len(files)} of {expected} changed files could be listed"]
+        else:
+            blockers = path_blockers(files, excluded_patterns)
     for blocker in blockers:
         report(blocker)
     short_sha = head_sha_after[:7]
@@ -156,6 +162,10 @@ class GitHubClient:
     def head_sha(self):
         pull, _ = self._request("GET", self.pull_path)
         return pull["head"]["sha"]
+
+    def changed_file_count(self):
+        pull, _ = self._request("GET", self.pull_path)
+        return pull["changed_files"]
 
     def _paginate(self, url):
         items = []

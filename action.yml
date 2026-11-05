@@ -124,6 +124,9 @@ runs:
         IGNORE_GLOBS: ${{ inputs.ignore-globs }}
         GITHUB__DEPLOYMENT_TYPE: user
         GITHUB__USER_TOKEN: ${{ steps.token.outputs.token }}
+        # The installation token cannot call GET /user, so name the login pr-agent posts as;
+        # otherwise it does not recognize its own comments and duplicates the summary.
+        GITHUB__AGENT_LOGIN: ${{ steps.token.outputs.app-slug }}[bot]
         DEEPSEEK__KEY: ${{ inputs.deepseek-api-key }}
         CONFIG__GIT_PROVIDER: github
         CONFIG__MODEL: ${{ inputs.model }}
