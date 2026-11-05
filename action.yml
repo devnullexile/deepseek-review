@@ -41,9 +41,9 @@ inputs:
   max-output-tokens:
     description: >-
       Output token limit per model call, including the model's thinking. deepseek-flash thinks
-      by default; a low limit can leave no room for the answer.
+      by default and allows up to 384K output tokens; a low limit can leave no room for the answer.
     required: false
-    default: "65536"
+    default: "384000"
   response-language:
     description: Locale of the review text.
     required: false

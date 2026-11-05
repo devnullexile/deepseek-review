@@ -92,7 +92,7 @@ jobs:
 | `extra-instructions` | пусто | Правила проекта, которые добавляются к общей политике ревью |
 | `model` | `deepseek/deepseek-flash` | Имя модели в LiteLLM; это DeepSeek-V4.1-Flash |
 | `max-model-tokens` | `128000` | Бюджет входных токенов на один вызов модели |
-| `max-output-tokens` | `65536` | Лимит выходных токенов на вызов, включая размышления модели |
+| `max-output-tokens` | `384000` | Лимит выходных токенов на вызов, включая размышления модели |
 | `response-language` | `en-US` | Язык ревью |
 | `max-findings` | `5` | Максимум замечаний |
 | `pr-agent-image` | `pragent/pr-agent:0.49.0` | Образ pr-agent; шаг approve зависит от формата его `--json-output` |

@@ -92,7 +92,7 @@ By default, the action reviews pull requests whose authors are repository owners
 | `extra-instructions` | empty | Project rules appended to the default review policy |
 | `model` | `deepseek/deepseek-flash` | LiteLLM model name; this is DeepSeek-V4.1-Flash |
 | `max-model-tokens` | `128000` | Input token budget per model call |
-| `max-output-tokens` | `65536` | Output token limit per call, including the model's thinking |
+| `max-output-tokens` | `384000` | Output token limit per call, including the model's thinking |
 | `response-language` | `en-US` | Review language |
 | `max-findings` | `5` | Maximum number of findings |
 | `pr-agent-image` | `pragent/pr-agent:0.49.0` | pr-agent image; the approval step relies on its `--json-output` format |
