@@ -72,6 +72,10 @@ jobs:
 
 `pull_request_target` runs the workflow file from the base branch with access to secrets, including for pull requests from forks. That is safe here only because no pull request code is executed. Do not add a step that checks out and runs the pull request head.
 
+## Runner requirements
+
+The action needs a Linux runner with Docker and Python 3. GitHub-hosted `ubuntu-latest` runners have both.
+
 ## Who gets reviewed
 
 By default, the action reviews pull requests whose authors are repository owners, organization members or collaborators. Each review costs DeepSeek tokens, so strangers cannot spend your key. To list exact logins instead, set `allowed-authors`. GitHub may report private organization members as `CONTRIBUTOR`; list them explicitly if that happens.
