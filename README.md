@@ -90,6 +90,7 @@ By default, the action reviews pull requests whose authors are repository owners
 | `allowed-authors` | empty | Logins to review; empty means owners, members and collaborators |
 | `approve` | `true` | Approve clean reviews and withdraw stale bot approvals |
 | `extra-instructions` | empty | Project rules appended to the default review policy |
+| `ignore-globs` | empty | JSON array of globs to skip, e.g. `'["*.meta", "*.unity"]'`; skipped files are not reviewed and do not block approval |
 | `model` | `deepseek/deepseek-flash` | LiteLLM model name; this is DeepSeek-V4.1-Flash |
 | `max-model-tokens` | `128000` | Input token budget per model call |
 | `max-output-tokens` | `384000` | Output token limit per call, including the model's thinking |

@@ -30,6 +30,12 @@ inputs:
     description: Project-specific review instructions appended to the default policy.
     required: false
     default: ""
+  ignore-globs:
+    description: >-
+      JSON array of file globs to leave out of the review, for example generated assets.
+      Ignored files are not reviewed and do not block approval.
+    required: false
+    default: ""
   model:
     description: LiteLLM model name. deepseek/deepseek-flash is DeepSeek-V4.1-Flash on the official DeepSeek API.
     required: false
@@ -104,6 +110,7 @@ runs:
         PR_URL: ${{ steps.gate.outputs.pr-url }}
         PR_AGENT_IMAGE: ${{ inputs.pr-agent-image }}
         EXTRA_INSTRUCTIONS: ${{ inputs.extra-instructions }}
+        IGNORE_GLOBS: ${{ inputs.ignore-globs }}
         GITHUB__DEPLOYMENT_TYPE: user
         GITHUB__USER_TOKEN: ${{ steps.token.outputs.token }}
         DEEPSEEK__KEY: ${{ inputs.deepseek-api-key }}
@@ -143,6 +150,9 @@ runs:
       run: |
         # BASE_INSTRUCTIONS ends with a newline, so the project text starts on its own line.
         export PR_REVIEWER__EXTRA_INSTRUCTIONS="${BASE_INSTRUCTIONS}${EXTRA_INSTRUCTIONS}"
+        if [ -n "$IGNORE_GLOBS" ]; then
+          export IGNORE__GLOB="$IGNORE_GLOBS"
+        fi
         out="$RUNNER_TEMP/deepseek-review"
         mkdir -p "$out"
         chmod 0777 "$out"
@@ -150,7 +160,7 @@ runs:
         env_args=()
         for name in $(compgen -e); do
           case "$name" in
-            GITHUB__*|DEEPSEEK__*|CONFIG__*|PR_REVIEWER__*) env_args+=(-e "$name") ;;
+            GITHUB__*|DEEPSEEK__*|CONFIG__*|PR_REVIEWER__*|IGNORE__*) env_args+=(-e "$name") ;;
           esac
         done
         docker run --rm --entrypoint /usr/local/bin/pr-agent \
