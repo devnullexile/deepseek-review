@@ -44,6 +44,13 @@ class ActionManifestTests(unittest.TestCase):
                 self.assertLessEqual(COMMAND_ENV[command], set(step.get("env") or {}))
         self.assertEqual(seen, set(COMMAND_ENV))
 
+    def test_default_token_window_leaves_input_capacity(self):
+        # pr-agent reserves max-output-tokens inside max-model-tokens; the rest is prompt input.
+        inputs = self.manifest["inputs"]
+        window = int(inputs["max-model-tokens"]["default"])
+        output = int(inputs["max-output-tokens"]["default"])
+        self.assertGreaterEqual(window - output, 100_000)
+
     def test_every_input_reference_is_declared(self):
         declared = set(self.manifest["inputs"])
         used = set(re.findall(r"inputs\.([\w-]+)", MANIFEST.read_text()))
