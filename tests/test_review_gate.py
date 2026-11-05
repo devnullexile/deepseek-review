@@ -86,6 +86,33 @@ class AuthorAllowedTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("mallory", reason)
 
+    def test_members_only_reviews_organization_members_whatever_their_association(self):
+        members = {"alice"}
+        for association in ("MEMBER", "CONTRIBUTOR", "NONE"):
+            with self.subTest(association=association):
+                allowed, _ = review_gate.author_allowed(
+                    pull_request(login="Alice", association=association), [],
+                    is_member=lambda login: login.lower() in members)
+                self.assertTrue(allowed)
+
+    def test_members_only_refuses_collaborators_outside_the_organization(self):
+        allowed, reason = review_gate.author_allowed(
+            pull_request(login="carol", association="COLLABORATOR"), [], is_member=lambda login: False)
+        self.assertFalse(allowed)
+        self.assertIn("not a member", reason)
+
+    def test_members_only_still_admits_explicitly_listed_authors(self):
+        allowed, _ = review_gate.author_allowed(
+            pull_request(login="helper-bot", association="NONE"), ["helper-bot"],
+            is_member=lambda login: False)
+        self.assertTrue(allowed)
+
+    def test_members_only_skips_drafts_without_asking_github(self):
+        def fail(login):
+            raise AssertionError("membership must not be checked for drafts")
+        allowed, _ = review_gate.author_allowed(pull_request(draft=True), [], is_member=fail)
+        self.assertFalse(allowed)
+
     def test_draft_pull_requests_are_skipped(self):
         allowed, reason = review_gate.author_allowed(pull_request(draft=True), [])
         self.assertFalse(allowed)

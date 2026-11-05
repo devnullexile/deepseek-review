@@ -15,7 +15,7 @@ MANIFEST = Path(os.environ.get("ACTION_MANIFEST",
                                Path(__file__).resolve().parents[1] / "action.yml"))
 STEP_KEYS = {"name", "id", "if", "shell", "env", "run", "uses", "with"}
 COMMAND_ENV = {
-    "gate": {"ALLOWED_AUTHORS", "IGNORE_GLOBS"},
+    "gate": {"ALLOWED_AUTHORS", "IGNORE_GLOBS", "GH_TOKEN", "MEMBERS_ONLY"},
     "head-sha": {"GH_TOKEN", "PR_NUMBER"},
     "approve": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN", "HEAD_SHA_BEFORE", "REVIEW_JSON",
                 "APPROVAL_EXCLUDED_PATHS", "APPROVE", "REQUEST_CHANGES"},
@@ -59,6 +59,10 @@ class ActionManifestTests(unittest.TestCase):
         [review_step] = [step for step in self.steps if "docker run" in step.get("run", "")]
         login = review_step["env"].get("GITHUB__AGENT_LOGIN", "")
         self.assertEqual(login, "${{ steps.token.outputs.app-slug }}[bot]")
+
+    def test_token_is_created_before_the_gate_that_uses_it(self):
+        ids = [step.get("id") for step in self.steps]
+        self.assertLess(ids.index("token"), ids.index("gate"))
 
     def test_every_input_reference_is_declared(self):
         declared = set(self.manifest["inputs"])

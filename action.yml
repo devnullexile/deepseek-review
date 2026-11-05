@@ -22,6 +22,14 @@ inputs:
       pull requests from repository owners, organization members and collaborators are reviewed.
     required: false
     default: ""
+  members-only:
+    description: >-
+      Review only pull requests whose authors are members of the organization that owns the
+      repository, checked through the GitHub API so private memberships count. Logins in
+      allowed-authors are reviewed too. The reviewer app needs the organization permission
+      Members: Read-only.
+    required: false
+    default: "false"
   approve:
     description: Approve when the review is complete and reports no concerns; withdraw the bot's approval otherwise.
     required: false
@@ -93,17 +101,10 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Check pull request author
-      id: gate
-      shell: bash
-      env:
-        ALLOWED_AUTHORS: ${{ inputs.allowed-authors }}
-        IGNORE_GLOBS: ${{ inputs.ignore-globs }}
-      run: python3 "$GITHUB_ACTION_PATH/scripts/review_gate.py" gate
-
+    # Created before the author gate, which needs it to check organization membership.
     - name: Create reviewer token
       id: token
-      if: steps.gate.outputs.run == 'true'
+      if: github.event.pull_request.draft == false
       uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
       with:
         app-id: ${{ inputs.app-id }}
@@ -112,6 +113,18 @@ runs:
         permission-contents: read
         permission-issues: write
         permission-pull-requests: write
+        permission-members: ${{ inputs.members-only == 'true' && 'read' || '' }}
+
+    - name: Check pull request author
+      id: gate
+      if: steps.token.outcome == 'success'
+      shell: bash
+      env:
+        ALLOWED_AUTHORS: ${{ inputs.allowed-authors }}
+        IGNORE_GLOBS: ${{ inputs.ignore-globs }}
+        MEMBERS_ONLY: ${{ inputs.members-only }}
+        GH_TOKEN: ${{ steps.token.outputs.token }}
+      run: python3 "$GITHUB_ACTION_PATH/scripts/review_gate.py" gate
 
     - name: Record reviewed head
       id: head
