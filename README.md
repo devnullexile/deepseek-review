@@ -110,4 +110,6 @@ Pin `@v1` for compatible updates, or a full commit SHA for an exact version. A c
 python3 -m unittest discover -s tests -v
 ```
 
+The `action.yml` contract tests need PyYAML and are skipped without it.
+
 The approval logic lives in `scripts/review_gate.py` and uses only the Python standard library.
