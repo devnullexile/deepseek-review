@@ -10,6 +10,8 @@ import urllib.request
 
 WRITER_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 NEGATIVE_SECURITY_ANSWERS = frozenset({"no", "none", "false"})
+# Used when APPROVAL_EXCLUDED_PATHS is unset; only an explicitly empty value approves any path.
+DEFAULT_EXCLUDED_PATHS = ".github/*"
 
 
 def author_allowed(pull_request, allowed_authors):
@@ -254,7 +256,8 @@ def command_approve():
     result = sync_approval(client, bot_login=os.environ["BOT_LOGIN"],
                            head_sha_before=os.environ.get("HEAD_SHA_BEFORE", ""),
                            head_sha_after=client.head_sha(), review=review,
-                           excluded_patterns=_split_list(os.environ.get("APPROVAL_EXCLUDED_PATHS", "")),
+                           excluded_patterns=_split_list(
+                               os.environ.get("APPROVAL_EXCLUDED_PATHS", DEFAULT_EXCLUDED_PATHS)),
                            report=lambda blocker: print(f"Not approving: {blocker}"))
     print(f"Approval result: {result}")
     _set_outputs(result=result)

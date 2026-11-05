@@ -221,6 +221,21 @@ class ApiCommandTests(CliTestCase):
         self.assertEqual(fake.writes(), [])
         self.assertIn(".github/workflows/x.yml", result.stdout)
 
+    def test_unset_excluded_paths_still_protect_github(self):
+        fake = self.start(files=[{"filename": ".github/workflows/x.yml"}])
+        result = self.run_cli("approve", **self.api_env(
+            fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=self.write_review(CLEAN)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs(), {"result": "not-approved"})
+
+    def test_explicitly_empty_excluded_paths_allow_any_path(self):
+        fake = self.start(files=[{"filename": ".github/workflows/x.yml"}])
+        result = self.run_cli("approve", **self.api_env(
+            fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=self.write_review(CLEAN),
+            APPROVAL_EXCLUDED_PATHS=""))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs(), {"result": "approved"})
+
     def test_missing_review_file_never_approves(self):
         fake = self.start()
         result = self.run_cli("approve", **self.api_env(

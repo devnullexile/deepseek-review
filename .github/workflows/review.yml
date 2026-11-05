@@ -25,3 +25,5 @@ jobs:
           deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
           app-id: ${{ vars.REVIEW_APP_ID }}
           app-private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          # This repository holds the approval rules, so a person approves changes to them too.
+          approval-excluded-paths: .github/*, action.yml, scripts/*
