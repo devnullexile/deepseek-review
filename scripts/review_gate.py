@@ -569,7 +569,13 @@ def command_gate():
 
 def command_take_label():
     """Remove the review label, so that adding it again asks for another review."""
-    _client_from_env().remove_label(os.environ.get("REVIEW_LABEL", "review").strip())
+    label = os.environ.get("REVIEW_LABEL", "review").strip()
+    try:
+        _client_from_env().remove_label(label)
+    except (GitHubError, OSError) as error:
+        # Only a convenience: the review goes on, and a person can remove the label.
+        print(f"::warning::The bot could not remove the {label!r} label, so remove it before adding "
+              f"it again ({error}).")
 
 
 def command_data_files():

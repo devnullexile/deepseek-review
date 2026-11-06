@@ -493,5 +493,14 @@ class LateEventTests(ApiCommandTests):
         self.assertEqual(json.loads(self.outputs()["ignore-globs"]), ["*.meta"])
         self.assertIn("could not list", result.stdout)
 
+
+class TakeLabelFailureTests(CliTestCase):
+    def test_a_label_that_cannot_be_removed_does_not_stop_the_review(self):
+        env = {"GITHUB_API_URL": "http://127.0.0.1:9", "GITHUB_REPOSITORY": "o/r", "PR_NUMBER": "7",
+               "GH_TOKEN": "t", "REVIEW_LABEL": "review"}
+        result = self.run_cli("take-label", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not remove", result.stdout)
+
 if __name__ == "__main__":
     unittest.main()
