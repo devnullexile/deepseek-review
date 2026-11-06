@@ -143,7 +143,7 @@ class StateMarkerTests(unittest.TestCase):
         repeat, late = finding(header="Duplicate asset IDs"), finding(line=5, header="Late")
         body = review_gate.result_comment(
             head_sha=HEAD, result="approved", blockers=[], review=review_of(repeat, late), skipped=[],
-            blocking=[], repeats=[(repeat, thread())], reviews=4, max_blocking=3)
+            blocking=[], repeats=[(repeat, thread())], reviews=4, max_blocking=3, capped=True)
         _, _, rest = body.partition("**Not blocking**")
         self.assertIn("repeats [an earlier finding](https://github.com/o/r/pull/7#discussion_T1)", rest)
         self.assertIn("max-blocking-reviews", body)
@@ -153,6 +153,34 @@ class StateMarkerTests(unittest.TestCase):
                                           blockers=["1 file(s) too large to review"], too_large=["big.rs"])
         self.assertIn("`big.rs`", body)
         self.assertIn("too large", body)
+
+
+class IssuePathTests(unittest.TestCase):
+    def test_a_path_the_model_wrote_with_spaces_quotes_or_a_slash_is_the_files_path(self):
+        for raw in ("scripts/review_gate.py\n", " `scripts/review_gate.py` ", "/scripts/review_gate.py"):
+            with self.subTest(raw=raw):
+                self.assertEqual(review_gate.issue_path({"relevant_file": raw}), "scripts/review_gate.py")
+        self.assertIsNone(review_gate.issue_path({"relevant_file": 7}))
+
+    def test_such_a_path_still_matches_its_thread_and_its_file(self):
+        issue = finding(path="a.py\n")
+        repeats = review_gate.repeated_findings([issue], [thread()], bot_login=BOT, started=STARTED)
+        self.assertIn(id(issue), repeats)
+        client = FakeFiles({("a.py", OLD): "x\ny\n", ("a.py", HEAD): "x\ny\n"})
+        self.assertEqual(review_gate.blocking_findings(client, review_of(issue), OLD, HEAD), [])
+        body = review_gate.result_comment(head_sha=HEAD, result="not-approved", blockers=["x"],
+                                          review=review_of(issue), skipped=[], repo_url="https://github.com/o/r")
+        self.assertIn(f"https://github.com/o/r/blob/{HEAD}/a.py#L2", body)
+
+
+class CappedNoteTests(unittest.TestCase):
+    def test_the_note_follows_the_decision_not_the_count(self):
+        late = finding(header="Late")
+        body = review_gate.result_comment(head_sha=HEAD, result="not-approved", blockers=["x"],
+                                          review=review_of(late), skipped=[], blocking=[], reviews=3,
+                                          max_blocking=3, capped=True)
+        self.assertIn("max-blocking-reviews", body)
+        self.assertIn("raised after the last review that can block", body)
 
 
 class LargeFileTests(unittest.TestCase):
@@ -278,6 +306,17 @@ class LoopCommandTests(ApiTestCase):
         note = (self.tmp / "deepseek-review" / "left-out.txt").read_text()
         self.assertIn("`big.rs`", note)
         self.assertIn("Do not report them", note)
+
+    def test_a_file_too_large_to_review_blocks_even_when_the_ignore_list_is_full(self):
+        many = [{"filename": f"data/{n:05}-{'x' * 80}.csv", "status": "added", "changes": 1, "patch": "@@"}
+                for n in range(2000)]
+        fake = self.start(files=many + [{"filename": "big.rs", "status": "modified", "changes": 4000}])
+        fake.contents = {("big.rs", HEAD): TOO_LARGE}
+        result = self.run_cli("data-files", **self.api_env(fake, RUNNER_TEMP=str(self.tmp)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.outputs()["ignore-globs"])[0], "big.rs")
+        self.assertEqual(json.loads((self.tmp / "deepseek-review" / "too-large-files.json").read_text()),
+                         ["big.rs"])
 
     def test_a_file_the_users_globs_leave_out_is_never_called_too_large(self):
         fake = self.start(files=[{"filename": "big.rs", "status": "modified", "changes": 4000}])

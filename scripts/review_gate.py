@@ -252,8 +252,17 @@ RESULT_TITLES = {
 _SUMMARIZED = re.compile(r"^\d+ (key issue\(s\) reported|finding\(s\) on lines changed|earlier finding\(s\))")
 
 
+def issue_path(issue):
+    """The file a finding names, as GitHub names it, or None. The model can add spaces, a line
+    break, quotes or a leading slash; pr-agent strips them the same way."""
+    path = issue.get("relevant_file") if isinstance(issue, dict) else None
+    if not isinstance(path, str):
+        return None
+    return path.strip().strip("`").strip().lstrip("/") or None
+
+
 def _where(issue):
-    where = str(issue.get("relevant_file") or "")
+    where = issue_path(issue) or ""
     lines = _issue_lines(issue)
     return where + (f":{lines[0]}" if lines else ""), lines
 
@@ -272,13 +281,14 @@ def _linked(label, url):
 
 def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None, reviewed_head="",
                    resolved=0, earlier=(), repo_url="", repeats=(), reviews=0, max_blocking=0,
-                   advisory=(), too_large=()):
+                   advisory=(), too_large=(), capped=False):
     """The bot's own result comment: what it decided, and a checklist of what to change.
 
     blocking lists the findings that block approval in a converging review (None: all do).
     earlier lists the bot's open threads from before this run. reviewed_head is the head this
     decision covers, kept for the next review, with reviews (how many reviews decided something,
-    this one included) and advisory (threads opened for findings that did not block). repeats
+    this one included) and advisory (threads opened for findings that did not block). capped says
+    that the review limit, max_blocking, kept the findings from blocking. repeats
     pairs each finding that repeats an earlier one with that earlier thread. too_large names files
     the model could not see. repo_url, when set, links files and threads.
     """
@@ -294,7 +304,6 @@ def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None
     blocking_issues = issues if blocking is None else [i for i in issues if any(i is b for b in blocking)]
     other_issues = [i for i in issues if not any(i is b for b in blocking_issues)]
     repeated = {id(issue): earlier_thread for issue, earlier_thread in repeats}
-    capped = blocking is not None and bool(max_blocking) and reviews > max_blocking
     if result == "head-changed":
         lines.append("New commits arrived during this review, so it decides nothing. "
                      "The next review of the latest commit will.")
@@ -304,7 +313,7 @@ def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None
         lines.append("**To get the bot's approval:**")
         for issue in blocking_issues[:10]:
             where, span = _where(issue)
-            link = _file_link(repo_url, head_sha, issue.get("relevant_file"), span)
+            link = _file_link(repo_url, head_sha, issue_path(issue), span)
             lines.append(f"- [ ] Fix, or answer in its thread: {_linked(_code(where, 200), link)} "
                          f"**{_text(issue.get('issue_header'), 80)}**: {_text(issue.get('issue_content'), 300)}")
         if len(blocking_issues) > 10:
@@ -329,7 +338,7 @@ def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None
         lines += ["", "**Not blocking**:"]
         for issue in other_issues[:10]:
             where, span = _where(issue)
-            link = _file_link(repo_url, head_sha, issue.get("relevant_file"), span)
+            link = _file_link(repo_url, head_sha, issue_path(issue), span)
             if id(issue) in repeated:
                 why = f"repeats {_linked('an earlier finding', repeated[id(issue)].get('url') or '')}"
             elif capped:
@@ -485,11 +494,11 @@ def blocking_findings(client, review, previous_head, head):
     changed = {}
     blocking = []
     for issue in issues:
-        if not isinstance(issue, dict) or not isinstance(issue.get("relevant_file"), str):
+        path = issue_path(issue)
+        if path is None:
             blocking.append(issue)
             continue
         lines = _issue_lines(issue)
-        path = issue["relevant_file"]
         if path not in changed:
             try:
                 old, new = client.file_at(path, previous_head), client.file_at(path, head)
@@ -560,7 +569,7 @@ def fixed_threads(client, review, threads, *, head, bot_login, started, left_out
         if not changed:
             continue
         raised_again = any(
-            isinstance(issue, dict) and issue.get("relevant_file") == path
+            isinstance(issue, dict) and issue_path(issue) == path
             and (region is None or (_issue_lines(issue) or (0, 0))[0] <= region[1] + 3
                  and (_issue_lines(issue) or (0, 0))[1] >= region[0] - 3)
             for issue in issues)
@@ -642,7 +651,7 @@ def repeated_findings(issues, threads, *, bot_login, started):
         if not isinstance(issue, dict):
             continue
         for thread in earlier:
-            if (thread.get("path") == issue.get("relevant_file")
+            if (thread.get("path") == issue_path(issue)
                     and same_point(issue.get("issue_header"), thread.get("title"))):
                 repeats[id(issue)] = thread
                 break
@@ -666,7 +675,7 @@ def advisory_threads(issues, blocking, threads, *, bot_login, started):
             continue
         start, end = min(start, end), max(start, end)
         covered = [issue for issue in issues if isinstance(issue, dict)
-                   and issue.get("relevant_file") == thread.get("path")
+                   and issue_path(issue) == thread.get("path")
                    and (_issue_lines(issue) or (0, -1))[0] <= end
                    and (_issue_lines(issue) or (0, -1))[1] >= start]
         if covered and not any(any(issue is b for b in blocking) for issue in covered):
@@ -1172,9 +1181,11 @@ def command_data_files():
             large = too_large_files(client, rest, base=client.base_sha(), head=client.head_sha())
         except (GitHubError, OSError) as error:
             print(f"::warning::Files too large to review could not be found, so every file is reviewed ({error}).")
-    globs, kept = ignore_list(user_globs, found + large)
+    # Files too large to review come first: the model must not see their wrong diff.
+    globs, kept = ignore_list(user_globs, large + found)
     skipped = [path for path in kept if path in found]
-    too_large = [path for path in kept if path in large]
+    # Each one blocks approval, also one that did not fit in the ignore list.
+    too_large = large
     if len(kept) < len(found) + len(large):
         print(f"{len(found) + len(large) - len(kept)} more file(s) are reviewed: the ignore list is full.")
     for path in skipped:
@@ -1187,7 +1198,7 @@ def command_data_files():
         with open(os.path.join(out, name), "w", encoding="utf-8") as handle:
             json.dump(value, handle)
     with open(os.path.join(out, "left-out.txt"), "w", encoding="utf-8") as handle:
-        handle.write(left_out_note(skipped + too_large))
+        handle.write(left_out_note([path for path in kept if path in large] + skipped))
     _set_outputs(**{"ignore-globs": json.dumps(globs) if globs else ""})
 
 
@@ -1334,7 +1345,8 @@ def command_approve():
             repo_url=f"{server}/{repository}" if repository else "",
             reviewed_head=head_sha_after if decided else earlier_head,
             repeats=(converge or {}).get("repeats") or (), reviews=state["reviews"] + int(decided),
-            max_blocking=max_blocking, advisory=advisory, too_large=too_large))
+            max_blocking=max_blocking, advisory=advisory, too_large=too_large,
+            capped=bool((converge or {}).get("capped"))))
 
 
 COMMANDS = {"gate": command_gate, "head-sha": command_head_sha, "approve": command_approve,
