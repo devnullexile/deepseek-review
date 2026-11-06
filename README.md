@@ -12,11 +12,18 @@ A GitHub Action that reviews pull requests with [pr-agent](https://github.com/qo
 4. Approves the pull request when all of these hold:
    - the merge recommendation is `no_concerns_found`;
    - no key issues and no security concerns were reported;
-   - every changed file that was not left out as data was fully reviewed;
+   - every changed file that was not left out as data was fully reviewed, and none was too large to send to the model (see [Data files](#data-files));
    - no changed file matches `approval-excluded-paths` (by default `.github/*`, so a person approves CI changes);
    - the head commit did not change while the review ran.
 
    After the first review of a pull request, a later review converges (`converge`): only findings on lines added or changed since the bot's last review block, and so do the bot's own earlier threads that nobody resolved. A point raised again on code the bot already reviewed, after a person answered and resolved it, no longer blocks. The model's merge recommendation is advisory when none of its findings blocks; with no finding at all, it still blocks. Security concerns, files not fully reviewed and protected paths still block.
+
+   So that a pull request does not go round after round, a later review also does not block on:
+   - a finding that repeats one of the bot's earlier points on the same file, also in other words, when that thread is still open (it blocks on its own) or a person resolved it;
+   - the bot's open threads for findings that did not block when they were raised, or on files left out of the review;
+   - any finding of the model once `max-blocking-reviews` (3) reviews of the pull request have decided something. The findings are still posted and listed; security concerns, files not fully reviewed, the bot's open threads from earlier reviews and protected paths still block.
+
+   A later review also tells the model that the author answered the earlier findings, so it reports only confirmed defects, mainly in changed code, and does not raise an answered point again.
 
    The approval is pinned to the reviewed commit. In any other case, the bot withdraws (dismisses) its own earlier approvals. A failed review also withdraws them. Reviews by people are never touched.
 5. Optionally (`request-changes: "true"`), requests changes when the model's verdict is `changes_required`. A later approval by the bot supersedes the request. A later completed review with a softer verdict withdraws it. A failed review keeps it, so a merge that the request blocks stays blocked.
@@ -28,6 +35,8 @@ A GitHub Action that reviews pull requests with [pr-agent](https://github.com/qo
    - any other blocker, such as security concerns or files not fully reviewed.
 
    Below the checklist it lists the findings that do not block, the data files a person should check, and the threads the bot resolved. It is updated on each review, not repeated.
+
+The model is told which files it does not see, and never to report a file or change it cannot see as missing, so the summary does not claim that code is absent.
 
 The approval is a signal, not a guarantee. A language model can miss defects, and the text of a pull request can try to manipulate it. Keep human review for anything that matters.
 
@@ -91,6 +100,8 @@ The `edited` trigger, the job condition and the `-edit` concurrency group review
 
 Lock files, JSON Lines, CSV and minified files, and JSON, YAML, XML or TOML files with more than `data-file-lines` (1000) added lines, are left out of the model review. They stay in the pull request: nothing is moved or removed. A model cannot review such files usefully, and a large one fills the token window, so the code would be left unreviewed. The result comment lists them for a person to check, and they do not block approval, like `ignore-globs`. A path in `approval-excluded-paths` is always reviewed. Turn this off with `skip-data-files: "false"`.
 
+GitHub sends no diff for a very large change, and serves a file over 1 MB without its content. pr-agent would then show such a file as deleted, or added in full, and the model would review that wrong diff. Such a file is left out of the model review too, whatever its type. The result comment names it for a person to review, and it blocks the bot's approval, because nobody reviewed its code.
+
 ## Review on request
 
 By default every new commit is reviewed (`review-on: push`). For a big pull request that goes through many rounds of fixes, set `review-on: label`. The pull request is then reviewed when it is opened, reopened, marked ready for review or retargeted, and after that only when someone adds the `review` label: on the pull request page, click **Labels** in the right column and choose `review`, or run `gh pr edit <number> --add-label review`. The bot removes the label when the review starts, so adding it again asks for another review of the latest commit. A new commit without the label withdraws the bot's approval of older commits, and the result comment says so. Create the label once under **Issues → Labels → New label**, and add `labeled` to the workflow's event types:
@@ -133,6 +144,7 @@ To review only members of the organization that owns the repository, set `member
 | `max-previous-findings-chars` | `60000` | Room for earlier findings and the replies in their resolved threads, so they are not raised again; pr-agent's own default is 8000, and `0` turns it off |
 | `result-comment` | `true` | Keep one comment with what the bot decided and why |
 | `converge` | `true` | After the first review, block only on findings on code changed since the last review and on the bot's own open threads |
+| `max-blocking-reviews` | `3` | How many reviews of one pull request can block on the model's findings; later ones only post them. `0` means no limit |
 | `resolve-fixed-threads` | `true` | Resolve the bot's threads whose lines a later commit changed, when the new review raised nothing there again |
 | `review-on` | `push` | `push` reviews every commit; `label` reviews new commits only when the review label is added (see [Review on request](#review-on-request)) |
 | `review-label` | `review` | Label that asks for a review of the latest commit; the bot removes it when the review starts |

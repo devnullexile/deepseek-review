@@ -16,10 +16,10 @@ MANIFEST = Path(os.environ.get("ACTION_MANIFEST",
 STEP_KEYS = {"name", "id", "if", "shell", "env", "run", "uses", "with"}
 COMMAND_ENV = {
     "gate": {"ALLOWED_AUTHORS", "IGNORE_GLOBS", "GH_TOKEN", "MEMBERS_ONLY", "REVIEW_ON", "REVIEW_LABEL"},
-    "head-sha": {"GH_TOKEN", "PR_NUMBER"},
+    "head-sha": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN"},
     "approve": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN", "HEAD_SHA_BEFORE", "REVIEW_JSON",
                 "APPROVAL_EXCLUDED_PATHS", "APPROVE", "REQUEST_CHANGES", "RESULT_COMMENT",
-                "CONVERGE", "RUN_STARTED", "RESOLVE_FIXED_THREADS"},
+                "CONVERGE", "RUN_STARTED", "RESOLVE_FIXED_THREADS", "MAX_BLOCKING_REVIEWS"},
     "data-files": {"GH_TOKEN", "PR_NUMBER", "IGNORE_GLOBS", "SKIP_DATA_FILES", "DATA_FILE_LINES",
                    "APPROVAL_EXCLUDED_PATHS"},
     "take-label": {"GH_TOKEN", "PR_NUMBER", "REVIEW_LABEL"},
@@ -100,6 +100,15 @@ class ActionManifestTests(unittest.TestCase):
     def test_the_result_comment_is_kept_even_when_approval_is_off(self):
         [approval] = [step for step in self.steps if step.get("id") == "approval"]
         self.assertIn("inputs.result-comment == 'true'", approval["if"])
+
+    def test_a_later_review_knows_how_many_reviews_came_before(self):
+        [review_step] = [step for step in self.steps if "docker run" in step.get("run", "")]
+        self.assertEqual(review_step["env"]["EARLIER_REVIEWS"], "${{ steps.head.outputs.reviews }}")
+        self.assertEqual(self.manifest["inputs"]["max-blocking-reviews"]["default"], "3")
+
+    def test_the_model_is_told_not_to_report_what_it_cannot_see_as_missing(self):
+        [review_step] = [step for step in self.steps if "docker run" in step.get("run", "")]
+        self.assertIn("you cannot see is missing", " ".join(review_step["env"]["BASE_INSTRUCTIONS"].split()))
 
     def test_every_input_reference_is_declared(self):
         declared = set(self.manifest["inputs"])

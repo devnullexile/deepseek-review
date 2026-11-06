@@ -35,6 +35,19 @@ RESULT_MARKER = "<!-- deepseek-review:result -->"
 # The head of the last decided review, kept in the result comment, so a later review knows what
 # it already saw.
 HEAD_MARKER_RE = re.compile(r"<!-- deepseek-review:head ([0-9a-f]{40}) -->")
+# How many reviews of this pull request decided something, and the bot's threads that were opened
+# for findings that did not block, so they never block a later review either.
+REVIEWS_MARKER_RE = re.compile(r"<!-- deepseek-review:reviews ([0-9]+) -->")
+ADVISORY_MARKER_RE = re.compile(r"<!-- deepseek-review:advisory ([A-Za-z0-9_=\- ]*) -->")
+# Words that say nothing about which point a finding makes, so two titles never match on them alone.
+GENERIC_TITLE_WORDS = frozenset({
+    "possible", "potential", "issue", "issues", "bug", "bugs", "problem", "problems", "concern",
+    "concerns", "risk", "error", "errors", "the", "and", "for", "with", "not", "from", "into"})
+# Two titles of one file make the same point when more than this share of their words is common
+# to both; exactly half is a shared topic, such as "SQL injection in search" and "... in export".
+SAME_POINT_SHARE = 0.5
+# File names given to the model as left out of its view; more are counted, not named.
+MAX_LEFT_OUT_NAMED = 40
 REVIEW_TRIGGERS = ("push", "label")
 # The pull request events that can ask for a review; any other, such as the bot removing its own
 # label (unlabeled), starts none. A payload without an action is treated as before: reviewed.
@@ -240,8 +253,17 @@ RESULT_TITLES = {
 _SUMMARIZED = re.compile(r"^\d+ (key issue\(s\) reported|finding\(s\) on lines changed|earlier finding\(s\))")
 
 
+def issue_path(issue):
+    """The file a finding names, as GitHub names it, or None. The model can add spaces, a line
+    break, quotes or a leading slash; pr-agent strips them the same way."""
+    path = issue.get("relevant_file") if isinstance(issue, dict) else None
+    if not isinstance(path, str):
+        return None
+    return path.strip().strip("`").strip().lstrip("/") or None
+
+
 def _where(issue):
-    where = str(issue.get("relevant_file") or "")
+    where = issue_path(issue) or ""
     lines = _issue_lines(issue)
     return where + (f":{lines[0]}" if lines else ""), lines
 
@@ -259,19 +281,22 @@ def _linked(label, url):
 
 
 def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None, reviewed_head="",
-                   resolved=0, earlier=(), repo_url=""):
+                   resolved=0, earlier=(), repo_url="", repeats=(), reviews=0, max_blocking=0,
+                   advisory=(), too_large=(), capped=False):
     """The bot's own result comment: what it decided, and a checklist of what to change.
 
     blocking lists the findings that block approval in a converging review (None: all do).
     earlier lists the bot's open threads from before this run. reviewed_head is the head this
-    decision covers, kept for the next review. repo_url, when set, links files and threads.
+    decision covers, kept for the next review, with reviews (how many reviews decided something,
+    this one included) and advisory (threads opened for findings that did not block). capped says
+    that the review limit, max_blocking, kept the findings from blocking. repeats
+    pairs each finding that repeats an earlier one with that earlier thread. too_large names files
+    the model could not see. repo_url, when set, links files and threads.
     """
     title = RESULT_TITLES.get(result, "Not approved")
     if result == "" and blockers:  # Comment-only mode: the title follows the blockers.
         title = "Not approved"
-    lines = [RESULT_MARKER]
-    if reviewed_head:
-        lines.append(f"<!-- deepseek-review:head {reviewed_head} -->")
+    lines = [RESULT_MARKER, *state_markers(reviewed_head, reviews, advisory)]
     lines += [f"### DeepSeek review: {title} (`{head_sha[:7]}`)", ""]
     output = review if isinstance(review, dict) else {}
     body = output.get("review") if isinstance(output.get("review"), dict) else {}
@@ -279,6 +304,7 @@ def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None
         if isinstance(body.get("key_issues_to_review"), list) else []
     blocking_issues = issues if blocking is None else [i for i in issues if any(i is b for b in blocking)]
     other_issues = [i for i in issues if not any(i is b for b in blocking_issues)]
+    repeated = {id(issue): earlier_thread for issue, earlier_thread in repeats}
     if result == "head-changed":
         lines.append("New commits arrived during this review, so it decides nothing. "
                      "The next review of the latest commit will.")
@@ -288,7 +314,7 @@ def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None
         lines.append("**To get the bot's approval:**")
         for issue in blocking_issues[:10]:
             where, span = _where(issue)
-            link = _file_link(repo_url, head_sha, issue.get("relevant_file"), span)
+            link = _file_link(repo_url, head_sha, issue_path(issue), span)
             lines.append(f"- [ ] Fix, or answer in its thread: {_linked(_code(where, 200), link)} "
                          f"**{_text(issue.get('issue_header'), 80)}**: {_text(issue.get('issue_content'), 300)}")
         if len(blocking_issues) > 10:
@@ -304,19 +330,33 @@ def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None
         for blocker in blockers:
             if not _SUMMARIZED.match(blocker):
                 lines.append(f"- [ ] {_text(blocker, 300)}")
+    if capped:
+        lines += ["", f"This is review {reviews} of this pull request. After {max_blocking} reviews the "
+                      "model's findings no longer block approval (`max-blocking-reviews`); security "
+                      "concerns, files not fully reviewed, open threads of the bot and paths a person "
+                      "approves still do."]
     if other_issues:
-        lines += ["", "**Not blocking**, raised again on code the previous review already saw:"]
+        lines += ["", "**Not blocking**:"]
         for issue in other_issues[:10]:
             where, span = _where(issue)
-            link = _file_link(repo_url, head_sha, issue.get("relevant_file"), span)
+            link = _file_link(repo_url, head_sha, issue_path(issue), span)
+            if id(issue) in repeated:
+                why = f"repeats {_linked('an earlier finding', repeated[id(issue)].get('url') or '')}"
+            elif capped:
+                why = "raised after the last review that can block"
+            else:
+                why = "raised again on code the previous review already saw"
             lines.append(f"- {_linked(_code(where, 200), link)} **{_text(issue.get('issue_header'), 80)}**: "
-                         f"{_text(issue.get('issue_content'), 300)}")
+                         f"{_text(issue.get('issue_content'), 300)} _({why})_")
     coverage = output.get("coverage") if isinstance(output.get("coverage"), dict) else {}
     unreviewed = [name for key in ("files_not_reviewed", "files_partially_reviewed")
                   if isinstance(coverage.get(key), list)
                   for name in coverage[key] if isinstance(name, str)]
     if unreviewed:
         lines += ["", f"The model could not review in full: {_listed(unreviewed)}."]
+    if too_large:
+        lines += ["", "**For a person to review**, too large for GitHub to send to the model, so it did not "
+                      f"see them: {_listed(list(too_large))}."]
     if skipped:
         lines += ["", f"**For a person to check**, left out of the review as data files: {_listed(skipped)}."]
     if resolved:
@@ -326,12 +366,35 @@ def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None
     return "\n".join(lines)
 
 
-def stale_comment(label, reviewed_head=""):
-    head = [f"<!-- deepseek-review:head {reviewed_head} -->"] if reviewed_head else []
+def stale_comment(label, reviewed_head="", reviews=0, advisory=()):
     return "\n".join([
-        RESULT_MARKER, *head, "### DeepSeek review: Not reviewed yet", "",
+        RESULT_MARKER, *state_markers(reviewed_head, reviews, advisory),
+        "### DeepSeek review: Not reviewed yet", "",
         f"New commits arrived after the last review. Add the `{label}` label to review them.",
         "", "_This comment is updated on every review._"])
+
+
+def state_markers(reviewed_head="", reviews=0, advisory=()):
+    """The hidden lines that carry what the next review needs to know."""
+    lines = [f"<!-- deepseek-review:head {reviewed_head} -->"] if reviewed_head else []
+    if reviews:
+        lines.append(f"<!-- deepseek-review:reviews {int(reviews)} -->")
+    ids = sorted(i for i in advisory if re.fullmatch(r"[A-Za-z0-9_=-]+", str(i)))
+    if ids:
+        lines.append(f"<!-- deepseek-review:advisory {' '.join(ids)} -->")
+    return lines
+
+
+def parse_state(body):
+    """What a result comment remembers: the head it decided, how many reviews decided something,
+    and the threads opened for findings that did not block."""
+    body = body or ""
+    head = HEAD_MARKER_RE.search(body)
+    reviews = REVIEWS_MARKER_RE.search(body)
+    advisory = ADVISORY_MARKER_RE.search(body)
+    return {"head": head.group(1) if head else "",
+            "reviews": int(reviews.group(1)) if reviews else 0,
+            "advisory": set(advisory.group(1).split()) if advisory else set()}
 
 
 def _own_result(client, bot_login):
@@ -342,21 +405,36 @@ def _own_result(client, bot_login):
     return None
 
 
-def previous_head(client, bot_login, head=""):
-    """The head the bot's last decided review covered, or "".
+def earlier_state(client, bot_login, head=""):
+    """What earlier reviews left: the head the bot's last decided review covered, how many reviews
+    decided something, and the threads opened for findings that did not block.
 
-    The result comment keeps it. Without one (result-comment off), the commit of the bot's
-    latest review of an earlier head stands in: older than the true one at worst, which only
-    counts more lines as changed.
+    The result comment keeps them. Without it (result-comment off, or a comment from an older
+    version), the bot's own reviews of earlier heads stand in: the latest of them for the head,
+    older than the true one at worst, which only counts more lines as changed; and the number of
+    distinct heads they cover for the count.
     """
-    comment = _own_result(client, bot_login)
-    found = HEAD_MARKER_RE.search((comment or {}).get("body") or "")
-    if found:
-        return found.group(1)
-    earlier = [record.get("commit_id") for record in client.list_reviews()
-               if (record.get("user") or {}).get("login") == bot_login
-               and record.get("commit_id") and record.get("commit_id") != head]
-    return earlier[-1] if earlier else ""
+    state = parse_state((_own_result(client, bot_login) or {}).get("body"))
+    if not state["head"] or not state["reviews"]:
+        try:
+            records = client.list_reviews()
+        except (GitHubError, OSError) as error:
+            # An unknown head keeps the review strict, and an unknown count sets no limit.
+            print(f"::warning::Earlier reviews could not be listed ({error}).")
+            records = []
+        earlier = [record.get("commit_id") for record in records
+                   if (record.get("user") or {}).get("login") == bot_login
+                   and record.get("commit_id") and record.get("commit_id") != head]
+        if not state["head"] and earlier:
+            state["head"] = earlier[-1]
+        if not state["reviews"]:
+            state["reviews"] = len(set(earlier))
+    return state
+
+
+def previous_head(client, bot_login, head=""):
+    """The head the bot's last decided review covered, or "" (see earlier_state)."""
+    return earlier_state(client, bot_login, head)["head"]
 
 
 def post_result(client, bot_login, body):
@@ -423,11 +501,11 @@ def blocking_findings(client, review, previous_head, head):
     changed = {}
     blocking = []
     for issue in issues:
-        if not isinstance(issue, dict) or not isinstance(issue.get("relevant_file"), str):
+        path = issue_path(issue)
+        if path is None:
             blocking.append(issue)
             continue
         lines = _issue_lines(issue)
-        path = issue["relevant_file"]
         if path not in changed:
             try:
                 old, new = client.file_at(path, previous_head), client.file_at(path, head)
@@ -456,12 +534,13 @@ def touched(old_text, new_text, start, end):
     return hit, ((min(where), max(where)) if where else None)
 
 
-def fixed_threads(client, review, threads, *, head, bot_login, started):
+def fixed_threads(client, review, threads, *, head, bot_login, started, left_out=()):
     """The bot's own open threads from before this run that a later commit fixed.
 
     A thread counts as fixed when the lines it pointed at were changed or removed between the
     commit it was written on and the head, and this review raised no finding on that region
-    again. Anything that cannot be read keeps the thread open.
+    again. Anything that cannot be read keeps the thread open, and so does a file left out of
+    the review (left_out), where the model could not have raised the point again.
     """
     login = bot_login.removesuffix("[bot]")
     issues = _review_body(review).get("key_issues_to_review")
@@ -470,7 +549,7 @@ def fixed_threads(client, review, threads, *, head, bot_login, started):
     # A file the model could not fully review cannot show that a point was not raised again.
     coverage = (review or {}).get("coverage") if isinstance((review or {}).get("coverage"), dict) else {}
     unreviewed = {name for key in ("files_not_reviewed", "files_partially_reviewed")
-                  if isinstance(coverage.get(key), list) for name in coverage[key]}
+                  if isinstance(coverage.get(key), list) for name in coverage[key]} | set(left_out)
     fixed = []
     for thread in threads:
         if (thread.get("isResolved") or thread.get("author") != login
@@ -497,7 +576,7 @@ def fixed_threads(client, review, threads, *, head, bot_login, started):
         if not changed:
             continue
         raised_again = any(
-            isinstance(issue, dict) and issue.get("relevant_file") == path
+            isinstance(issue, dict) and issue_path(issue) == path
             and (region is None or (_issue_lines(issue) or (0, 0))[0] <= region[1] + 3
                  and (_issue_lines(issue) or (0, 0))[1] >= region[0] - 3)
             for issue in issues)
@@ -506,7 +585,7 @@ def fixed_threads(client, review, threads, *, head, bot_login, started):
     return fixed
 
 
-def resolve_fixed_threads(client, review, *, head, bot_login, started, report=print):
+def resolve_fixed_threads(client, review, *, head, bot_login, started, report=print, left_out=()):
     """Resolve the bot's threads that a later commit fixed. Returns how many it resolved."""
     try:
         threads = client.review_threads()
@@ -514,7 +593,8 @@ def resolve_fixed_threads(client, review, *, head, bot_login, started, report=pr
         report(f"::warning::Fixed threads could not be checked: {error}")
         return 0
     count = 0
-    for thread in fixed_threads(client, review, threads, head=head, bot_login=bot_login, started=started):
+    for thread in fixed_threads(client, review, threads, head=head, bot_login=bot_login, started=started,
+                                left_out=left_out):
         try:
             client.resolve_thread(thread["id"], (
                 f"Resolved by the bot: the lines this finding pointed at changed in `{head[:7]}`, "
@@ -525,29 +605,149 @@ def resolve_fixed_threads(client, review, *, head, bot_login, started, report=pr
     return count
 
 
-def open_earlier_findings(client, bot_login, started):
-    """Threads the bot opened before this run that nobody resolved: answered findings close."""
+def open_earlier_findings(client, bot_login, started, *, threads=None, advisory=(), left_out=()):
+    """Threads the bot opened before this run that nobody resolved: answered findings close.
+
+    A thread opened for a finding that did not block (advisory) does not count, nor does one on a
+    file left out of the review (left_out), which does not block approval either.
+    """
     login = bot_login.removesuffix("[bot]")
-    return [thread for thread in client.review_threads()
+    return [thread for thread in (client.review_threads() if threads is None else threads)
             if not thread.get("isResolved")
             and ((thread.get("author") or "") == login)
-            and (thread.get("created_at") or "") < started]
+            and (thread.get("created_at") or "") < started
+            and thread.get("id") not in advisory
+            and thread.get("path") not in left_out]
 
 
-def converge_state(client, review, *, previous_head, head, bot_login, started):
-    """For a later review: the findings that block, and the bot's open earlier threads.
+def finding_title(body):
+    """The title pr-agent gives an inline finding: its bold first line."""
+    found = re.match(r"\s*\*\*([^*\n]+)\*\*", body or "")
+    return found.group(1).strip() if found else ""
 
-    Raises GitHubError when either cannot be read; the caller then blocks approval.
+
+def _title_words(title):
+    return {word for word in re.findall(r"\w+", str(title or "").lower())
+            if (len(word) > 2 or not word.isascii()) and word not in GENERIC_TITLE_WORDS}
+
+
+def same_point(title, other):
+    """Whether two finding titles make the same point, also in other words."""
+    words, others = _title_words(title), _title_words(other)
+    if not words or not others:
+        return False
+    return len(words & others) / len(words | others) > SAME_POINT_SHARE
+
+
+def repeated_findings(issues, threads, *, bot_login, started, advisory=(), left_out=()):
+    """Findings that repeat a point the bot raised before this run, mapped (by id()) to that thread.
+
+    A point repeats when an earlier thread of the bot on the same file has the same title, also in
+    other words, and that thread is still open and blocks on its own (it is not advisory and not on a
+    file left out of the review), or a person resolved it.
+    A thread the bot resolved itself, because a commit changed its lines, does not count: the
+    point coming back means the change did not fix it.
     """
-    return {"blocking": blocking_findings(client, review, previous_head, head),
-            "earlier": open_earlier_findings(client, bot_login, started)}
+    login = bot_login.removesuffix("[bot]")
+    earlier = [thread for thread in threads
+               if thread.get("author") == login and (thread.get("created_at") or "") < started
+               and thread.get("title")
+               and ((not thread.get("isResolved") and thread.get("id") not in advisory
+                     and thread.get("path") not in left_out)
+                    or (thread.get("isResolved") and thread.get("resolved_by")
+                        and thread.get("resolved_by") != login))]
+    repeats = {}
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        for thread in earlier:
+            if (thread.get("path") == issue_path(issue)
+                    and same_point(issue.get("issue_header"), thread.get("title"))):
+                repeats[id(issue)] = thread
+                break
+    return repeats
 
 
-def decision_blockers(client, review, excluded_patterns=(), *, converge=None):
+def advisory_threads(issues, blocking, threads, *, bot_login, started):
+    """The ids of the threads this run opened for findings that do not block.
+
+    A thread belongs to a finding on the same file whose lines it covers. A thread that also
+    covers a blocking finding blocks.
+    """
+    login = bot_login.removesuffix("[bot]")
+    found = set()
+    for thread in threads:
+        if (thread.get("author") != login or (thread.get("created_at") or "") < started
+                or not thread.get("id") or thread.get("isResolved")):
+            continue
+        start, end = thread.get("original_start"), thread.get("original_end")
+        if not (isinstance(start, int) and isinstance(end, int)):
+            continue
+        start, end = min(start, end), max(start, end)
+        covered = [issue for issue in issues if isinstance(issue, dict)
+                   and issue_path(issue) == thread.get("path")
+                   and (_issue_lines(issue) or (0, -1))[0] <= end
+                   and (_issue_lines(issue) or (0, -1))[1] >= start]
+        if covered and not any(any(issue is b for b in blocking) for issue in covered):
+            found.add(thread["id"])
+    return found
+
+
+def converge_state(client, review, *, previous_head, head, bot_login, started, reviews=0,
+                   max_blocking=0, advisory=frozenset(), left_out=frozenset()):
+    """For a later review: the findings that block, the bot's open earlier threads, and why the
+    other findings do not block.
+
+    reviews counts the earlier reviews that decided something; once max_blocking of them did
+    (0: no limit), no finding of the model blocks. A finding that repeats an earlier point does
+    not block either. Raises GitHubError when anything cannot be read; the caller then blocks.
+    """
+    threads = client.review_threads()
+    issues = _review_body(review).get("key_issues_to_review")
+    issues = issues if isinstance(issues, list) else []
+    capped = bool(max_blocking) and reviews >= max_blocking
+    repeats = repeated_findings(issues, threads, bot_login=bot_login, started=started,
+                                advisory=advisory, left_out=left_out)
+    blocking = [] if capped else [
+        issue for issue in blocking_findings(client, review, previous_head, head) or []
+        if id(issue) not in repeats]
+    return {"blocking": blocking, "capped": capped,
+            "repeats": [(issue, repeats[id(issue)]) for issue in issues if id(issue) in repeats],
+            "earlier": open_earlier_findings(client, bot_login, started, threads=threads,
+                                             advisory=advisory, left_out=left_out)}
+
+
+def too_large_files(client, files, *, base, head):
+    """Changed files the model would see wrongly, in the order GitHub lists them.
+
+    GitHub sends no patch for a file whose diff is too large, and serves a file over 1 MB without
+    its content, so pr-agent would read that version as empty and show the file as deleted or
+    added in full. A file whose content cannot be read in either version counts. A read error
+    keeps the file in the review, as before.
+    """
+    found = []
+    for changed in files:
+        name = changed.get("filename") or ""
+        if not name or "patch" in changed or not (changed.get("changes") or 0) > 0:
+            continue
+        versions = []
+        if changed.get("status") != "removed":
+            versions.append((name, head))
+        if changed.get("status") != "added":
+            versions.append((changed.get("previous_filename") or name, base))
+        try:
+            if not all(client.readable(path, ref) for path, ref in versions):
+                found.append(name)
+        except (GitHubError, OSError) as error:
+            print(f"::warning::{name} could not be checked, so it is reviewed as it is: {error}")
+    return found
+
+
+def decision_blockers(client, review, excluded_patterns=(), *, converge=None, too_large=()):
     """Every reason that prevents approval of this review, including paths a person approves.
 
     converge, for a later review, holds the blocking findings and open earlier threads, or an
-    error that blocks approval.
+    error that blocks approval. too_large names files the model could not see.
     """
     if converge and converge.get("error"):
         return [f"earlier findings could not be checked ({converge['error']})"]
@@ -555,6 +755,8 @@ def decision_blockers(client, review, excluded_patterns=(), *, converge=None):
     blockers = approval_blockers(review, blocking)
     if converge and converge.get("earlier"):
         blockers.append(f"{len(converge['earlier'])} earlier finding(s) of the bot are not resolved")
+    if too_large:
+        blockers.append(f"{len(too_large)} file(s) too large to review; a person must review them")
     if not blockers and excluded_patterns:
         files = client.list_files()
         expected = client.changed_file_count()
@@ -568,7 +770,7 @@ def decision_blockers(client, review, excluded_patterns=(), *, converge=None):
 
 def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
                   excluded_patterns=(), approve=True, request_changes=False,
-                  report=lambda blocker: None, note="", converge=None):
+                  report=lambda blocker: None, note="", converge=None, too_large=()):
     """Bring the bot's own review state in line with the latest review of an unchanged head.
 
     Approves a clean review (when approve is set), requests changes when the model says
@@ -590,7 +792,7 @@ def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
         return (latest is not None and latest.get("state") == state
                 and latest.get("commit_id") == head_sha_after)
 
-    blockers = decision_blockers(client, review, excluded_patterns, converge=converge)
+    blockers = decision_blockers(client, review, excluded_patterns, converge=converge, too_large=too_large)
     for blocker in blockers:
         report(blocker)
     short_sha = head_sha_after[:7]
@@ -719,6 +921,10 @@ class GitHubClient:
         pull, _, _ = self._request("GET", self.pull_path)
         return pull["head"]["sha"]
 
+    def base_sha(self):
+        pull, _, _ = self._request("GET", self.pull_path)
+        return pull["base"]["sha"]
+
     def changed_file_count(self):
         pull, _, _ = self._request("GET", self.pull_path)
         return pull["changed_files"]
@@ -759,13 +965,24 @@ class GitHubClient:
             raise GitHubError(f"{path} at {ref[:7]} cannot be read as one file")
         return base64.b64decode(item.get("content") or "").decode("utf-8", "replace")
 
+    def readable(self, path, ref):
+        """Whether GitHub serves this file's text at a commit; a missing file has nothing to read.
+        A file over 1 MB comes without its content."""
+        try:
+            item, _, _ = self._request("GET", f"{self.repo_path}/contents/{urllib.parse.quote(path)}?ref={ref}")
+        except GitHubError as error:
+            if error.status == 404:
+                return True
+            raise
+        return not isinstance(item, dict) or item.get("encoding") == "base64"
+
     def review_threads(self):
         """Every review thread: who opened it, when, and whether it is resolved."""
         query = """query($owner: String!, $name: String!, $number: Int!, $after: String) {
           repository(owner: $owner, name: $name) { pullRequest(number: $number) {
             reviewThreads(first: 100, after: $after) { pageInfo { hasNextPage endCursor }
-              nodes { id isResolved path line startLine originalLine originalStartLine
-                comments(first: 1) { nodes { author { login } createdAt url originalCommit { oid } } } } } } } }"""
+              nodes { id isResolved path line startLine originalLine originalStartLine resolvedBy { login }
+                comments(first: 1) { nodes { author { login } createdAt url body originalCommit { oid } } } } } } } }"""
         owner, name = self.repository.split("/", 1)
         threads, after = [], None
         while True:
@@ -784,6 +1001,8 @@ class GitHubClient:
                 comment = first[0] or {}
                 threads.append({"id": node.get("id"), "isResolved": node.get("isResolved"),
                                 "author": (comment.get("author") or {}).get("login"),
+                                "resolved_by": (node.get("resolvedBy") or {}).get("login"),
+                                "title": finding_title(comment.get("body")),
                                 "created_at": comment.get("createdAt"),
                                 "path": node.get("path"),
                                 "original_start": node.get("originalStartLine") or node.get("originalLine"),
@@ -937,34 +1156,60 @@ def command_take_label():
               f"it again ({error}).")
 
 
+def left_out_note(paths):
+    """The instruction that tells the model which changed files it does not see, and why."""
+    if not paths:
+        return ""
+    named = _listed(list(paths), MAX_LEFT_OUT_NAMED)
+    return (f"These changed files are left out of this review, as data or because they are too large to "
+            f"read: {named}. Do not report them, or a change in them, as missing from the pull request.\n")
+
+
 def command_data_files():
-    """The ignore list for pr-agent: the user's globs plus the data files of this pull request."""
+    """The ignore list for pr-agent: the user's globs plus the data files of this pull request and
+    the files too large to review, and a note that tells the model about them."""
     text = os.environ.get("IGNORE_GLOBS", "")
     _validate_ignore_globs(text)
     user_globs = json.loads(text) if text.strip() else []
-    skipped = []
-    if _true("SKIP_DATA_FILES", "true"):
-        max_lines = _positive_int("data-file-lines", os.environ.get("DATA_FILE_LINES", "1000"))
-        protected = _split_list(os.environ.get("APPROVAL_EXCLUDED_PATHS", DEFAULT_EXCLUDED_PATHS))
+    skip_data = _true("SKIP_DATA_FILES", "true")
+    max_lines = _positive_int("data-file-lines", os.environ.get("DATA_FILE_LINES", "1000")) if skip_data else 0
+    protected = _split_list(os.environ.get("APPROVAL_EXCLUDED_PATHS", DEFAULT_EXCLUDED_PATHS))
+    client = _client_from_env()
+    try:
+        listed = client.list_files()
+    except (GitHubError, OSError) as error:
+        # This step only helps the review; a GitHub hiccup must not stop it.
+        print(f"::warning::Data files could not be found, so every file is reviewed: could not list "
+              f"the changed files ({error}).")
+        listed = []
+    found = data_files(listed, max_lines=max_lines, protected=protected) if skip_data else []
+    # A file the user's globs leave out is not reviewed anyway, and must not block approval.
+    rest = [changed for changed in listed if changed.get("filename") not in found
+            and not any(fnmatch.fnmatchcase(changed.get("filename") or "", glob) for glob in user_globs)]
+    large = []
+    if any("patch" not in changed for changed in rest):
         try:
-            listed = _client_from_env().list_files()
+            large = too_large_files(client, rest, base=client.base_sha(), head=client.head_sha())
         except (GitHubError, OSError) as error:
-            # This step only helps the review; a GitHub hiccup must not stop it.
-            print(f"::warning::Data files could not be found, so every file is reviewed: could not list "
-                  f"the changed files ({error}).")
-            listed = []
-        found = data_files(listed, max_lines=max_lines, protected=protected)
-        globs, skipped = ignore_list(user_globs, found)
-        if len(skipped) < len(found):
-            print(f"{len(found) - len(skipped)} more data file(s) are reviewed: the ignore list is full.")
-    else:
-        globs = user_globs
+            print(f"::warning::Files too large to review could not be found, so every file is reviewed ({error}).")
+    # Files too large to review come first: the model must not see their wrong diff.
+    globs, kept = ignore_list(user_globs, large + found)
+    skipped = [path for path in kept if path in found]
+    # Each one blocks approval, also one that did not fit in the ignore list.
+    too_large = large
+    if len(kept) < len(found) + len(large):
+        print(f"{len(found) + len(large) - len(kept)} more file(s) are reviewed: the ignore list is full.")
     for path in skipped:
         print(f"Leaving out of the review as data: {path}")
+    for path in too_large:
+        print(f"Leaving out of the review as too large for GitHub to send: {path}")
     out = os.path.join(os.environ["RUNNER_TEMP"], "deepseek-review")
     os.makedirs(out, exist_ok=True)
-    with open(os.path.join(out, "data-files.json"), "w", encoding="utf-8") as handle:
-        json.dump(skipped, handle)
+    for name, value in (("data-files.json", skipped), ("too-large-files.json", too_large)):
+        with open(os.path.join(out, name), "w", encoding="utf-8") as handle:
+            json.dump(value, handle)
+    with open(os.path.join(out, "left-out.txt"), "w", encoding="utf-8") as handle:
+        handle.write(left_out_note([path for path in kept if path in large] + skipped))
     _set_outputs(**{"ignore-globs": json.dumps(globs) if globs else ""})
 
 
@@ -995,23 +1240,39 @@ def command_stale():
         if failures:
             raise failures[0]
     if comment:
-        post_result(client, bot_login, stale_comment(label, previous_head(client, bot_login)))
+        state = earlier_state(client, bot_login)
+        post_result(client, bot_login, stale_comment(label, state["head"], state["reviews"], state["advisory"]))
 
 
 def command_head_sha():
     # Threads the bot opens from now on belong to this run; older ones are earlier findings.
     started = datetime.datetime.now(datetime.timezone.utc)
-    _set_outputs(sha=_client_from_env().head_sha(), started=started.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    client = _client_from_env()
+    head = client.head_sha()
+    reviews = 0
+    bot_login = os.environ.get("BOT_LOGIN", "")
+    if bot_login:
+        try:  # Only shapes the instructions for the model; the approval step reads it again.
+            reviews = earlier_state(client, bot_login, head)["reviews"]
+        except (GitHubError, OSError) as error:
+            print(f"::warning::Earlier reviews could not be counted ({error}).")
+    _set_outputs(sha=head, started=started.strftime("%Y-%m-%dT%H:%M:%SZ"), reviews=reviews)
 
 
-def _skipped_data_files():
-    path = os.path.join(os.environ.get("RUNNER_TEMP", ""), "deepseek-review", "data-files.json")
+def _skipped_data_files(name="data-files.json"):
+    path = os.path.join(os.environ.get("RUNNER_TEMP", ""), "deepseek-review", name)
     try:
         with open(path, encoding="utf-8") as handle:
             value = json.load(handle)
     except (OSError, ValueError):
         return []
     return [name for name in value if isinstance(name, str)] if isinstance(value, list) else []
+
+
+def _whole_number(name, text):
+    if not re.fullmatch(r"[0-9]+", text or ""):
+        raise SystemExit(f"{name} must be a whole number, not {text!r}.")
+    return int(text)
 
 
 def command_approve():
@@ -1021,10 +1282,13 @@ def command_approve():
     comment = _true("RESULT_COMMENT", "true")
     converging = _true("CONVERGE", "true")
     resolving = _true("RESOLVE_FIXED_THREADS", "true")
+    max_blocking = _whole_number("max-blocking-reviews", os.environ.get("MAX_BLOCKING_REVIEWS", "3"))
     client = _client_from_env()
     review = _load_review(os.environ["REVIEW_JSON"])
     excluded = _split_list(os.environ.get("APPROVAL_EXCLUDED_PATHS", DEFAULT_EXCLUDED_PATHS))
     skipped = _skipped_data_files()
+    too_large = _skipped_data_files("too-large-files.json")
+    left_out = set(skipped) | set(too_large)
     head_sha_before = os.environ.get("HEAD_SHA_BEFORE", "")
     head_sha_after = client.head_sha()
     blockers = []
@@ -1032,39 +1296,57 @@ def command_approve():
             if skipped else "")
     bot_login = os.environ["BOT_LOGIN"]
     started = os.environ.get("RUN_STARTED", "")
+    unchanged = head_sha_before == head_sha_after
     resolved = 0
-    if resolving and usable_review(review) and started and head_sha_before == head_sha_after:
+    if resolving and usable_review(review) and started and unchanged:
         # First, so a thread a commit fixed no longer counts as an open earlier finding.
         resolved = resolve_fixed_threads(client, review, head=head_sha_after, bot_login=bot_login,
-                                         started=started)
+                                         started=started, left_out=left_out)
         if resolved:
             print(f"Resolved {resolved} thread(s) of the bot that a later commit fixed.")
-    earlier_head = previous_head(client, bot_login, head_sha_after) if (converging or comment) else ""
+    state = (earlier_state(client, bot_login, head_sha_after) if (converging or comment)
+             else {"head": "", "reviews": 0, "advisory": set()})
+    earlier_head = state["head"]
     # A later review blocks only on what it had not seen; the first review stays strict.
     converge = None
-    if converging and earlier_head and usable_review(review) and head_sha_before == head_sha_after:
+    if converging and earlier_head and usable_review(review) and unchanged:
         try:
             converge = converge_state(client, review, previous_head=earlier_head, head=head_sha_after,
-                                      bot_login=bot_login, started=started)
+                                      bot_login=bot_login, started=started, reviews=state["reviews"],
+                                      max_blocking=max_blocking, advisory=state["advisory"],
+                                      left_out=left_out)
         except GitHubError as error:
             converge = {"error": str(error)}
+    if converge and converge.get("capped"):
+        print(f"Review {state['reviews'] + 1}: after {max_blocking} reviews, findings no longer block.")
     if approve or request_changes:
         result = sync_approval(client, bot_login=bot_login,
                                head_sha_before=head_sha_before, head_sha_after=head_sha_after,
                                review=review, excluded_patterns=excluded, approve=approve,
                                request_changes=request_changes, note=note, converge=converge,
+                               too_large=too_large,
                                report=lambda blocker: (blockers.append(blocker),
                                                        print(f"Not approving: {blocker}")))
     else:
-        result = "" if head_sha_before == head_sha_after else "head-changed"
+        result = "" if unchanged else "head-changed"
         if not result:
-            blockers = decision_blockers(client, review, excluded, converge=converge)
+            blockers = decision_blockers(client, review, excluded, converge=converge, too_large=too_large)
     print(f"Approval result: {result}")
     _set_outputs(result=result)
     if comment:
         blocking = (converge or {}).get("blocking")
         # Only a usable review marks its head as seen; a failed one must not shrink the next.
         decided = result != "head-changed" and usable_review(review)
+        advisory = set(state["advisory"])
+        if decided and blocking is not None:
+            try:
+                threads = client.review_threads()
+                still_open = {t.get("id") for t in threads if not t.get("isResolved")}
+                issues = _review_body(review).get("key_issues_to_review") or []
+                advisory = (advisory & still_open) | advisory_threads(
+                    issues, blocking, threads, bot_login=bot_login, started=started)
+            except GitHubError as error:
+                print(f"::warning::Threads for findings that do not block could not be recorded: {error}")
         repository = os.environ.get("GITHUB_REPOSITORY", "")
         server = os.environ.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
         post_result(client, bot_login, result_comment(
@@ -1072,7 +1354,10 @@ def command_approve():
             skipped=skipped, blocking=blocking, resolved=resolved,
             earlier=(converge or {}).get("earlier") or [],
             repo_url=f"{server}/{repository}" if repository else "",
-            reviewed_head=head_sha_after if decided else earlier_head))
+            reviewed_head=head_sha_after if decided else earlier_head,
+            repeats=(converge or {}).get("repeats") or (), reviews=state["reviews"] + int(decided),
+            max_blocking=max_blocking, advisory=advisory, too_large=too_large,
+            capped=bool((converge or {}).get("capped"))))
 
 
 COMMANDS = {"gate": command_gate, "head-sha": command_head_sha, "approve": command_approve,
