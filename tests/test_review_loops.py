@@ -73,6 +73,17 @@ class RepeatedFindingTests(unittest.TestCase):
                                                                started=STARTED), {})
 
 
+    def test_an_open_thread_that_does_not_block_is_not_a_point_already_raised(self):
+        issue = finding()
+        for earlier, advisory, left_out in ((thread("T2"), {"T2"}, set()), (thread(), set(), {"a.py"})):
+            with self.subTest(advisory=advisory, left_out=left_out):
+                self.assertEqual(review_gate.repeated_findings([issue], [earlier], bot_login=BOT, started=STARTED,
+                                                               advisory=advisory, left_out=left_out), {})
+        answered = thread("T2", resolved=True, resolved_by="alice")
+        self.assertIn(id(issue), review_gate.repeated_findings([issue], [answered], bot_login=BOT,
+                                                               started=STARTED, advisory={"T2"}))
+
+
 class FakeFiles:
     def __init__(self, files):
         self.files = files

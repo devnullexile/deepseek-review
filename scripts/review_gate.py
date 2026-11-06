@@ -639,11 +639,12 @@ def same_point(title, other):
     return len(words & others) / len(words | others) > SAME_POINT_SHARE
 
 
-def repeated_findings(issues, threads, *, bot_login, started):
+def repeated_findings(issues, threads, *, bot_login, started, advisory=(), left_out=()):
     """Findings that repeat a point the bot raised before this run, mapped (by id()) to that thread.
 
     A point repeats when an earlier thread of the bot on the same file has the same title, also in
-    other words, and that thread is still open, so it blocks on its own, or a person resolved it.
+    other words, and that thread is still open and blocks on its own (it is not advisory and not on a
+    file left out of the review), or a person resolved it.
     A thread the bot resolved itself, because a commit changed its lines, does not count: the
     point coming back means the change did not fix it.
     """
@@ -651,8 +652,10 @@ def repeated_findings(issues, threads, *, bot_login, started):
     earlier = [thread for thread in threads
                if thread.get("author") == login and (thread.get("created_at") or "") < started
                and thread.get("title")
-               and (not thread.get("isResolved")
-                    or (thread.get("resolved_by") and thread.get("resolved_by") != login))]
+               and ((not thread.get("isResolved") and thread.get("id") not in advisory
+                     and thread.get("path") not in left_out)
+                    or (thread.get("isResolved") and thread.get("resolved_by")
+                        and thread.get("resolved_by") != login))]
     repeats = {}
     for issue in issues:
         if not isinstance(issue, dict):
@@ -703,7 +706,8 @@ def converge_state(client, review, *, previous_head, head, bot_login, started, r
     issues = _review_body(review).get("key_issues_to_review")
     issues = issues if isinstance(issues, list) else []
     capped = bool(max_blocking) and reviews >= max_blocking
-    repeats = repeated_findings(issues, threads, bot_login=bot_login, started=started)
+    repeats = repeated_findings(issues, threads, bot_login=bot_login, started=started,
+                                advisory=advisory, left_out=left_out)
     blocking = [] if capped else [
         issue for issue in blocking_findings(client, review, previous_head, head) or []
         if id(issue) not in repeats]
