@@ -628,5 +628,32 @@ class CommentOnlyTitleTests(unittest.TestCase):
         self.assertIn("Not approved", body)
         self.assertNotIn("Reviewed", body.splitlines()[1])
 
+
+class UsableReviewTests(unittest.TestCase):
+    def test_only_a_complete_review_shape_is_usable(self):
+        self.assertTrue(review_gate.usable_review(clean_review()))
+        for review in (None, [], {"review": None}, {"review": [1]}, {"review": "text"},
+                       {"review": {"key_issues_to_review": "x", "merge_recommendation": "x"}},
+                       {"review": {"key_issues_to_review": []}}):
+            with self.subTest(review=review):
+                self.assertFalse(review_gate.usable_review(review))
+
+    def test_helpers_never_fail_on_a_review_body_that_is_not_a_dict(self):
+        class NoFiles:
+            def file_at(self, path, ref):
+                raise AssertionError("no file is read for an unusable review")
+        for review in ({"review": [1]}, {"review": "text"}):
+            with self.subTest(review=review):
+                self.assertIsNone(review_gate.blocking_findings(NoFiles(), review, OLD, HEAD))
+                self.assertEqual(review_gate.fixed_threads(NoFiles(), review, [], head=HEAD,
+                                                           bot_login=BOT, started="z"), [])
+
+
+class VerdictWithoutFindingsTests(unittest.TestCase):
+    def test_a_verdict_with_no_finding_still_blocks_a_converging_review(self):
+        review = clean_review(merge_recommendation="changes_required")
+        self.assertEqual(review_gate.approval_blockers(review, blocking_issues=[]),
+                         ["merge recommendation is 'changes_required'"])
+
 if __name__ == "__main__":
     unittest.main()

@@ -679,5 +679,29 @@ class StaleDismissTests(ApiTestCase):
         self.assertEqual(dismissed, ["/repos/o/r/pulls/7/reviews/404/dismissals",
                                      "/repos/o/r/pulls/7/reviews/2/dismissals"])
 
+
+class ConvergeWithoutCommentTests(ApiTestCase):
+    def test_a_failed_review_never_marks_its_head_as_seen(self):
+        fake = self.start()
+        env = self.api_env(fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD,
+                           REVIEW_JSON=self.write_review({"review": {"key_issues_to_review": "x"}}),
+                           APPROVAL_EXCLUDED_PATHS="", RESULT_COMMENT="true", RUNNER_TEMP=str(self.tmp),
+                           RUN_STARTED="2026-06-01T00:00:00Z")
+        self.run_cli("approve", **env)
+        self.assertNotIn("deepseek-review:head", fake.comments[0]["body"])
+
+    def test_without_a_result_comment_the_last_reviewed_head_comes_from_the_bots_reviews(self):
+        fake = self.start(reviews=[review_record(1, BOT, "COMMENTED", OLD),
+                                   review_record(2, BOT, "COMMENTED", HEAD)])
+        fake.contents = {("a.py", OLD): "same\n", ("a.py", HEAD): "same\nnew\n"}
+        review = json.loads(json.dumps(CLEAN))
+        review["review"].update(merge_recommendation="changes_required", key_issues_to_review=[
+            {"relevant_file": "a.py", "start_line": 1, "end_line": 1, "issue_header": "h", "issue_content": "c"}])
+        env = self.api_env(fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=self.write_review(review),
+                           APPROVAL_EXCLUDED_PATHS="", RESULT_COMMENT="false", RUNNER_TEMP=str(self.tmp),
+                           RUN_STARTED="2026-06-01T00:00:00Z")
+        result = self.run_cli("approve", **env)
+        self.assertIn("Approval result: approved", result.stdout)
+
 if __name__ == "__main__":
     unittest.main()

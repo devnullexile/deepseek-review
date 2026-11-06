@@ -89,9 +89,10 @@ inputs:
       After the first review of a pull request, block approval only on what the bot had not seen:
       findings on lines added or changed since its last review, and its own earlier findings that
       nobody resolved. A point raised again on code the bot already reviewed, after a person
-      answered and resolved it, no longer blocks, and the model's merge recommendation is then
-      advisory. Security concerns, files not fully reviewed and paths a person approves still
-      block. The first review of a pull request is unchanged.
+      answered and resolved it, no longer blocks, and the model's merge recommendation is advisory
+      when none of its findings blocks; with no finding at all it still blocks. Security concerns,
+      files not fully reviewed and paths a person approves still block. The first review of a pull
+      request is unchanged.
     required: false
     default: "true"
   resolve-fixed-threads:

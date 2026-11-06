@@ -83,7 +83,7 @@ def approval_blockers(output, blocking_issues=None):
 
     The check fails closed: anything missing or unexpected blocks approval. With
     blocking_issues (a later review that converges), only those findings block, and the merge
-    recommendation is advisory: it blocks only together with a blocking finding.
+    recommendation is advisory when the review has findings and none of them blocks.
     """
     if not isinstance(output, dict) or not isinstance(output.get("review"), dict):
         return ["review output is missing or malformed"]
@@ -104,6 +104,9 @@ def approval_blockers(output, blocking_issues=None):
     elif blocking_issues:
         blockers.append(f"merge recommendation is {recommendation!r}")
         blockers.append(f"{len(blocking_issues)} finding(s) on lines changed since the last review")
+    elif not issues and recommendation != "no_concerns_found":
+        # With no finding at all the verdict is the only signal, so it still blocks.
+        blockers.append(f"merge recommendation is {recommendation!r}")
 
     if _security_concern(review.get("security_concerns")):
         blockers.append("security concerns reported")
@@ -339,11 +342,21 @@ def _own_result(client, bot_login):
     return None
 
 
-def previous_head(client, bot_login):
-    """The head the bot's last decided review covered, from its result comment, or ""."""
+def previous_head(client, bot_login, head=""):
+    """The head the bot's last decided review covered, or "".
+
+    The result comment keeps it. Without one (result-comment off), the commit of the bot's
+    latest review of an earlier head stands in: older than the true one at worst, which only
+    counts more lines as changed.
+    """
     comment = _own_result(client, bot_login)
     found = HEAD_MARKER_RE.search((comment or {}).get("body") or "")
-    return found.group(1) if found else ""
+    if found:
+        return found.group(1)
+    earlier = [record.get("commit_id") for record in client.list_reviews()
+               if (record.get("user") or {}).get("login") == bot_login
+               and record.get("commit_id") and record.get("commit_id") != head]
+    return earlier[-1] if earlier else ""
 
 
 def post_result(client, bot_login, body):
@@ -362,6 +375,19 @@ def _recommendation(output):
     if not isinstance(output, dict) or not isinstance(output.get("review"), dict):
         return None
     return output["review"].get("merge_recommendation")
+
+
+def _review_body(review):
+    """The review part of pr-agent's output, or {} for any other shape."""
+    body = review.get("review") if isinstance(review, dict) else None
+    return body if isinstance(body, dict) else {}
+
+
+def usable_review(review):
+    """Whether pr-agent's output is a review the bot can decide on: a verdict and a finding list."""
+    body = _review_body(review)
+    return isinstance(body.get("merge_recommendation"), str) and isinstance(
+        body.get("key_issues_to_review"), list)
 
 
 def changed_lines(old_text, new_text):
@@ -391,7 +417,7 @@ def blocking_findings(client, review, previous_head, head):
     cannot be read. A finding on code the previous review already saw does not block: it was
     reported then, and an earlier thread that is still open blocks on its own.
     """
-    issues = ((review or {}).get("review") or {}).get("key_issues_to_review")
+    issues = _review_body(review).get("key_issues_to_review")
     if not isinstance(issues, list):
         return None
     changed = {}
@@ -438,7 +464,7 @@ def fixed_threads(client, review, threads, *, head, bot_login, started):
     again. Anything that cannot be read keeps the thread open.
     """
     login = bot_login.removesuffix("[bot]")
-    issues = ((review or {}).get("review") or {}).get("key_issues_to_review")
+    issues = _review_body(review).get("key_issues_to_review")
     if not isinstance(issues, list):
         return []
     # A file the model could not fully review cannot show that a point was not raised again.
@@ -1007,16 +1033,16 @@ def command_approve():
     bot_login = os.environ["BOT_LOGIN"]
     started = os.environ.get("RUN_STARTED", "")
     resolved = 0
-    if resolving and isinstance(review, dict) and started and head_sha_before == head_sha_after:
+    if resolving and usable_review(review) and started and head_sha_before == head_sha_after:
         # First, so a thread a commit fixed no longer counts as an open earlier finding.
         resolved = resolve_fixed_threads(client, review, head=head_sha_after, bot_login=bot_login,
                                          started=started)
         if resolved:
             print(f"Resolved {resolved} thread(s) of the bot that a later commit fixed.")
-    earlier_head = previous_head(client, bot_login) if (converging or comment) else ""
+    earlier_head = previous_head(client, bot_login, head_sha_after) if (converging or comment) else ""
     # A later review blocks only on what it had not seen; the first review stays strict.
     converge = None
-    if converging and earlier_head and isinstance(review, dict) and head_sha_before == head_sha_after:
+    if converging and earlier_head and usable_review(review) and head_sha_before == head_sha_after:
         try:
             converge = converge_state(client, review, previous_head=earlier_head, head=head_sha_after,
                                       bot_login=bot_login, started=started)
@@ -1037,7 +1063,8 @@ def command_approve():
     _set_outputs(result=result)
     if comment:
         blocking = (converge or {}).get("blocking")
-        decided = result != "head-changed" and isinstance(review, dict)
+        # Only a usable review marks its head as seen; a failed one must not shrink the next.
+        decided = result != "head-changed" and usable_review(review)
         repository = os.environ.get("GITHUB_REPOSITORY", "")
         server = os.environ.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
         post_result(client, bot_login, result_comment(

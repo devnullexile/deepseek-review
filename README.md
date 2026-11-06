@@ -16,7 +16,7 @@ A GitHub Action that reviews pull requests with [pr-agent](https://github.com/qo
    - no changed file matches `approval-excluded-paths` (by default `.github/*`, so a person approves CI changes);
    - the head commit did not change while the review ran.
 
-   After the first review of a pull request, a later review converges (`converge`): only findings on lines added or changed since the bot's last review block, and so do the bot's own earlier threads that nobody resolved. A point raised again on code the bot already reviewed, after a person answered and resolved it, no longer blocks, and the model's merge recommendation is then advisory. Security concerns, files not fully reviewed and protected paths still block.
+   After the first review of a pull request, a later review converges (`converge`): only findings on lines added or changed since the bot's last review block, and so do the bot's own earlier threads that nobody resolved. A point raised again on code the bot already reviewed, after a person answered and resolved it, no longer blocks. The model's merge recommendation is advisory when none of its findings blocks; with no finding at all, it still blocks. Security concerns, files not fully reviewed and protected paths still block.
 
    The approval is pinned to the reviewed commit. In any other case, the bot withdraws (dismisses) its own earlier approvals. A failed review also withdraws them. Reviews by people are never touched.
 5. Optionally (`request-changes: "true"`), requests changes when the model's verdict is `changes_required`. A later approval by the bot supersedes the request. A later completed review with a softer verdict withdraws it. A failed review keeps it, so a merge that the request blocks stays blocked.
