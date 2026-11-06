@@ -27,6 +27,10 @@ class FakeGitHub:
         self.reviews = reviews
         self.files = list(files)
         self.members = None if members is None else set(members)
+        self.comments = []
+        self.labels = {"review"}
+        self.threads = []  # {"isResolved", "author", "createdAt"}
+        self.contents = {}  # (path, ref) -> text
         self.requests = []
         fake = self
 
@@ -65,6 +69,16 @@ class FakeGitHub:
                 if self.path == "/repos/o/r/pulls/7":
                     return self._send(200, {"head": {"sha": fake.head_sha},
                                             "changed_files": len(fake.files)})
+                if self.path.startswith("/repos/o/r/contents/"):
+                    path, _, ref = self.path[len("/repos/o/r/contents/"):].partition("?ref=")
+                    text = fake.contents.get((path, ref))
+                    if text is None:
+                        return self._send(404, {"message": "Not Found"})
+                    import base64
+                    return self._send(200, {"encoding": "base64",
+                                            "content": base64.b64encode(text.encode()).decode()})
+                if self.path.startswith("/repos/o/r/issues/7/comments"):
+                    return self._send(200, fake.comments)
                 if self.path.startswith("/repos/o/r/pulls/7/reviews"):
                     page = 2 if "page=2" in self.path else 1
                     half = len(fake.reviews) // 2
@@ -75,11 +89,53 @@ class FakeGitHub:
                 self._send(404, {"message": "Not Found"})
 
             def do_POST(self):
-                fake.requests.append(("POST", self.path, self._body(), None))
+                body = self._body()
+                if self.path == "/graphql" and body["query"].lstrip().startswith("mutation"):
+                    fake.requests.append(("POST", self.path, body, None))
+                    if "resolveReviewThread" in body["query"]:
+                        for thread in fake.threads:
+                            if thread.get("id") == body["variables"]["id"]:
+                                thread["isResolved"] = True
+                    return self._send(200, {"data": {}})
+                if self.path == "/graphql":
+                    fake.requests.append(("GET", self.path, body, None))  # A read.
+                    nodes = [{"id": t.get("id"), "isResolved": t["isResolved"], "path": t.get("path"),
+                              "line": t.get("line"), "originalLine": t.get("originalLine"),
+                              "originalStartLine": t.get("originalStartLine"),
+                              "comments": {"nodes": [
+                        {"author": {"login": t["author"]}, "createdAt": t["createdAt"],
+                         "originalCommit": {"oid": t.get("commit")}}]}}
+                        for t in fake.threads]
+                    return self._send(200, {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}}}}})
+                fake.requests.append(("POST", self.path, body, None))
+                if self.path == "/repos/o/r/issues/7/comments":
+                    fake.comments.append({"id": len(fake.comments) + 1, "user": {"login": BOT},
+                                          "body": body["body"]})
                 self._send(200, {})
+
+            def do_PATCH(self):
+                body = self._body()
+                fake.requests.append(("PATCH", self.path, body, None))
+                comment_id = int(self.path.rsplit("/", 1)[1])
+                for comment in fake.comments:
+                    if comment["id"] == comment_id:
+                        comment["body"] = body["body"]
+                self._send(200, {})
+
+            def do_DELETE(self):
+                fake.requests.append(("DELETE", self.path, None, None))
+                name = self.path.rsplit("/", 1)[1]
+                if name in fake.labels:
+                    fake.labels.discard(name)
+                    return self._send(200, [])
+                self._send(404, {"message": "Label does not exist"})
 
             def do_PUT(self):
                 fake.requests.append(("PUT", self.path, self._body(), None))
+                review_id = int(self.path.split("/reviews/")[1].split("/")[0]) if "/reviews/" in self.path else 0
+                if review_id in getattr(fake, "fail_dismissals", set()):
+                    return self._send(422, {"message": "Can not dismiss a dismissed review"})
                 self._send(200, {})
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -176,10 +232,14 @@ class GateCommandTests(CliTestCase):
         self.assertIn("pull_request", result.stdout + result.stderr)
 
 
-class ApiCommandTests(CliTestCase):
+class ApiTestCase(CliTestCase):
+    """Helpers for commands that call the GitHub API; no tests of its own."""
+
     def api_env(self, fake, **extra):
+        # The result comment has its own tests; the others check reviews only.
         return {"GITHUB_API_URL": fake.url, "GITHUB_REPOSITORY": "o/r", "PR_NUMBER": "7",
-                "GH_TOKEN": "secret-token", **extra}
+                "GH_TOKEN": "secret-token", "RESULT_COMMENT": "false", "REVIEW_API_RETRY_DELAY": "0",
+                **extra}
 
     def start(self, head_sha=HEAD, reviews=(), files=(), members=()):
         fake = FakeGitHub(head_sha, list(reviews), files, members)
@@ -191,6 +251,8 @@ class ApiCommandTests(CliTestCase):
         path.write_text(json.dumps(payload))
         return str(path)
 
+
+class ApiCommandTests(ApiTestCase):
     def members_only_gate(self, fake, login, owner_type="Organization", draft=False, **env):
         event = self.tmp / "event.json"
         event.write_text(json.dumps({
@@ -250,7 +312,9 @@ class ApiCommandTests(CliTestCase):
         fake = self.start()
         result = self.run_cli("head-sha", **self.api_env(fake))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.outputs(), {"sha": HEAD})
+        outputs = self.outputs()
+        self.assertEqual(outputs["sha"], HEAD)
+        self.assertRegex(outputs["started"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         self.assertEqual(fake.requests[0][3], "Bearer secret-token")
 
     def test_approve_posts_an_approval_pinned_to_the_reviewed_commit(self):
@@ -338,6 +402,306 @@ class ApiCommandTests(CliTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("404", result.stdout + result.stderr)
 
+
+
+class NewCommandTests(ApiTestCase):
+    def test_data_files_merges_the_users_globs_with_this_pull_requests_data(self):
+        fake = self.start(files=[
+            {"filename": "uv.lock", "additions": 3, "changes": 3, "patch": "@@"},
+            {"filename": "src/app.py", "additions": 4000, "changes": 4000, "patch": "@@"},
+            {"filename": ".github/workflows/x.yml", "additions": 5000, "changes": 5000}])
+        result = self.run_cli("data-files", **self.api_env(
+            fake, IGNORE_GLOBS='["*.meta"]', RUNNER_TEMP=str(self.tmp)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.outputs()["ignore-globs"]), ["*.meta", "uv.lock"])
+        listed = json.loads((self.tmp / "deepseek-review" / "data-files.json").read_text())
+        self.assertEqual(listed, ["uv.lock"])
+
+    def test_data_files_can_be_turned_off(self):
+        fake = self.start(files=[{"filename": "uv.lock", "additions": 3, "changes": 3, "patch": "@@"}])
+        result = self.run_cli("data-files", **self.api_env(
+            fake, SKIP_DATA_FILES="false", RUNNER_TEMP=str(self.tmp)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs()["ignore-globs"], "")
+
+    def test_the_review_label_is_taken_and_a_missing_one_is_fine(self):
+        fake = self.start()
+        for _ in range(2):
+            result = self.run_cli("take-label", **self.api_env(fake, REVIEW_LABEL="review"))
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(fake.labels, set())
+
+    def test_new_commits_in_label_mode_withdraw_the_bots_approval_and_say_why(self):
+        fake = self.start(reviews=[review_record(1, BOT, "APPROVED", OLD),
+                                   review_record(2, "alice", "APPROVED", OLD)])
+        result = self.run_cli("stale", **self.api_env(fake, BOT_LOGIN=BOT, RESULT_COMMENT="true"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        dismissed = [path for method, path, _ in fake.writes() if method == "PUT"]
+        self.assertEqual(dismissed, ["/repos/o/r/pulls/7/reviews/1/dismissals"])
+        self.assertIn("Add the `review` label", fake.comments[0]["body"])
+
+    def test_approve_keeps_one_result_comment_up_to_date(self):
+        fake = self.start()
+        review = self.write_review(CLEAN)
+        env = self.api_env(fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=review,
+                           APPROVAL_EXCLUDED_PATHS="", RESULT_COMMENT="true", RUNNER_TEMP=str(self.tmp))
+        for _ in range(2):
+            result = self.run_cli("approve", **env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(fake.comments), 1)
+        self.assertIn("Approved", fake.comments[0]["body"])
+
+    def test_gate_skips_other_labels_and_reports_stale_commits_in_label_mode(self):
+        event = self.tmp / "event.json"
+        pr = {"number": 7, "html_url": "u", "draft": False, "user": {"login": "alice"},
+              "author_association": "OWNER"}
+        cases = [({"action": "labeled", "label": {"name": "bug"}}, "push", {"run": "false"}),
+                 ({"action": "synchronize"}, "label", {"run": "false", "stale": "true", "pr-number": "7"}),
+                 ({"action": "labeled", "label": {"name": "review"}}, "label",
+                  {"run": "true", "pr-number": "7", "pr-url": "u", "label-requested": "true"})]
+        for payload, trigger, expected in cases:
+            with self.subTest(payload=payload, trigger=trigger):
+                self.output.write_text("")
+                event.write_text(json.dumps(dict(payload, pull_request=pr)))
+                result = self.run_cli("gate", GITHUB_EVENT_PATH=str(event), ALLOWED_AUTHORS="",
+                                      REVIEW_ON=trigger)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.outputs(), expected)
+
+    def test_gate_refuses_an_unknown_review_mode(self):
+        event = self.tmp / "event.json"
+        event.write_text(json.dumps({"action": "opened", "pull_request": {"number": 7}}))
+        result = self.run_cli("gate", GITHUB_EVENT_PATH=str(event), REVIEW_ON="sometimes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("review-on", result.stdout + result.stderr)
+
+
+class LabelModeGateTests(CliTestCase):
+    def test_a_push_to_a_pull_request_the_bot_skips_never_touches_it(self):
+        event = self.tmp / "event.json"
+        for pr in ({"number": 7, "html_url": "u", "draft": True, "user": {"login": "alice"},
+                    "author_association": "OWNER"},
+                   {"number": 7, "html_url": "u", "draft": False, "user": {"login": "stranger"},
+                    "author_association": "NONE"}):
+            with self.subTest(pr=pr):
+                self.output.write_text("")
+                event.write_text(json.dumps({"action": "synchronize", "pull_request": pr}))
+                result = self.run_cli("gate", GITHUB_EVENT_PATH=str(event), ALLOWED_AUTHORS="",
+                                      REVIEW_ON="label")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.outputs(), {"run": "false"})
+
+
+class StaleAndValidationTests(ApiTestCase):
+    def test_a_stale_run_keeps_an_approval_of_the_current_head(self):
+        fake = self.start(head_sha=HEAD, reviews=[review_record(1, BOT, "APPROVED", OLD),
+                                                  review_record(2, BOT, "APPROVED", HEAD)])
+        result = self.run_cli("stale", **self.api_env(fake, BOT_LOGIN=BOT, RESULT_COMMENT="true"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The current head is already approved, so nothing is stale and nothing changes.
+        self.assertEqual(fake.writes(), [])
+
+    def test_an_invalid_flag_is_refused_before_any_change(self):
+        fake = self.start(reviews=[review_record(1, BOT, "APPROVED", OLD)])
+        review = self.write_review(CLEAN)
+        for command, env in (("stale", dict(BOT_LOGIN=BOT, RESULT_COMMENT="yes")),
+                             ("approve", dict(BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=review,
+                                              APPROVAL_EXCLUDED_PATHS="", RESULT_COMMENT="False"))):
+            with self.subTest(command=command):
+                result = self.run_cli(command, **self.api_env(fake, **env))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("result-comment", result.stdout + result.stderr)
+        self.assertEqual(fake.writes(), [])
+
+
+class LateEventTests(ApiTestCase):
+    def test_a_stale_run_after_a_review_of_the_current_head_changes_nothing(self):
+        fake = self.start(head_sha=HEAD, reviews=[review_record(1, BOT, "APPROVED", OLD),
+                                                  review_record(2, BOT, "CHANGES_REQUESTED", HEAD)])
+        result = self.run_cli("stale", **self.api_env(fake, BOT_LOGIN=BOT, RESULT_COMMENT="true"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(fake.writes(), [])
+
+    def test_data_files_falls_back_to_the_users_globs_when_github_fails(self):
+        fake = self.start()
+        env = self.api_env(fake, IGNORE_GLOBS='["*.meta"]', RUNNER_TEMP=str(self.tmp))
+        env["GITHUB_API_URL"] = "http://127.0.0.1:9"  # Nothing listens: the listing fails.
+        result = self.run_cli("data-files", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.outputs()["ignore-globs"]), ["*.meta"])
+        self.assertIn("could not list", result.stdout)
+
+
+class TakeLabelFailureTests(CliTestCase):
+    def test_a_label_that_cannot_be_removed_does_not_stop_the_review(self):
+        env = {"GITHUB_API_URL": "http://127.0.0.1:9", "GITHUB_REPOSITORY": "o/r", "PR_NUMBER": "7",
+               "GH_TOKEN": "t", "REVIEW_LABEL": "review", "REVIEW_API_RETRY_DELAY": "0"}
+        result = self.run_cli("take-label", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not remove", result.stdout)
+
+
+class ConvergeCommandTests(ApiTestCase):
+    FINDING = {"relevant_file": "a.py", "start_line": 1, "end_line": 1,
+               "issue_header": "Possible Bug", "issue_content": "raised again"}
+
+    def review_with_finding(self):
+        review = json.loads(json.dumps(CLEAN))
+        review["review"]["merge_recommendation"] = "changes_required"
+        review["review"]["key_issues_to_review"] = [self.FINDING]
+        return self.write_review(review)
+
+    def approve(self, fake, **extra):
+        env = self.api_env(fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=self.review_with_finding(),
+                           APPROVAL_EXCLUDED_PATHS="", RESULT_COMMENT="true", RUNNER_TEMP=str(self.tmp),
+                           RUN_STARTED="2026-06-01T00:00:00Z", REQUEST_CHANGES="true", **extra)
+        return self.run_cli("approve", **env)
+
+    def seen_before(self, fake):
+        fake.comments.append({"id": 1, "user": {"login": BOT},
+                              "body": f"<!-- deepseek-review:result -->\n<!-- deepseek-review:head {OLD} -->"})
+        fake.contents = {("a.py", OLD): "same\n", ("a.py", HEAD): "same\nnew\n"}
+
+    def test_the_first_review_stays_strict(self):
+        fake = self.start()
+        result = self.approve(fake)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("changes-requested", result.stdout)
+
+    def test_a_point_raised_again_on_reviewed_code_does_not_block_once_answered(self):
+        fake = self.start()
+        self.seen_before(fake)
+        fake.threads = [{"isResolved": True, "author": BOT.removesuffix("[bot]"),
+                         "createdAt": "2026-05-01T00:00:00Z"}]
+        result = self.approve(fake)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Approval result: approved", result.stdout)
+        self.assertIn("**Not blocking**", fake.comments[0]["body"])
+
+    def test_an_unanswered_earlier_finding_still_blocks(self):
+        fake = self.start()
+        self.seen_before(fake)
+        fake.threads = [{"isResolved": False, "author": BOT.removesuffix("[bot]"),
+                         "createdAt": "2026-05-01T00:00:00Z"}]
+        result = self.approve(fake)
+        self.assertIn("earlier finding(s) of the bot are not resolved", result.stdout)
+        self.assertNotIn("Approval result: approved", result.stdout)
+        # Only the old point is open, so changes are not requested.
+        self.assertNotIn("changes-requested", result.stdout)
+
+    def test_a_finding_on_changed_code_blocks_and_asks_for_changes(self):
+        fake = self.start()
+        self.seen_before(fake)
+        finding = dict(self.FINDING, start_line=2, end_line=2)
+        review = json.loads(json.dumps(CLEAN))
+        review["review"].update(merge_recommendation="changes_required", key_issues_to_review=[finding])
+        env = self.api_env(fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=self.write_review(review),
+                           APPROVAL_EXCLUDED_PATHS="", RESULT_COMMENT="true", RUNNER_TEMP=str(self.tmp),
+                           RUN_STARTED="2026-06-01T00:00:00Z", REQUEST_CHANGES="true")
+        result = self.run_cli("approve", **env)
+        self.assertIn("lines changed since the last review", result.stdout)
+        self.assertIn("changes-requested", result.stdout)
+
+    def test_converge_can_be_turned_off(self):
+        fake = self.start()
+        self.seen_before(fake)
+        result = self.approve(fake, CONVERGE="false")
+        self.assertIn("changes-requested", result.stdout)
+
+
+class ResolveFixedThreadTests(ApiTestCase):
+    def run_approve(self, fake, review):
+        env = self.api_env(fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=self.write_review(review),
+                           APPROVAL_EXCLUDED_PATHS="", RESULT_COMMENT="true", RUNNER_TEMP=str(self.tmp),
+                           RUN_STARTED="2026-06-01T00:00:00Z")
+        return self.run_cli("approve", **env)
+
+    def thread(self, line=2):
+        return {"id": "T1", "isResolved": False, "author": BOT.removesuffix("[bot]"),
+                "createdAt": "2026-05-01T00:00:00Z", "path": "a.py", "originalLine": line,
+                "originalStartLine": None, "commit": OLD}
+
+    def test_a_thread_whose_lines_a_commit_changed_is_resolved_and_then_counts_as_answered(self):
+        fake = self.start()
+        fake.contents = {("a.py", OLD): "one\nbad\nthree\n", ("a.py", HEAD): "one\ngood\nthree\n"}
+        fake.threads = [self.thread()]
+        result = self.run_approve(fake, CLEAN)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(fake.threads[0]["isResolved"])
+        replies = [b for m, p, b in fake.writes() if p == "/graphql" and "Reply" in b["query"]]
+        self.assertIn("changed in `ccccccc`", replies[0]["variables"]["body"])
+        self.assertIn("resolved 1 earlier thread", fake.comments[0]["body"])
+
+    def test_a_thread_on_untouched_lines_or_raised_again_stays_open(self):
+        for old, new, issues in (
+                ("one\nbad\nthree\n", "zero\none\nbad\nthree\n", []),  # Only shifted.
+                ("one\nbad\nthree\n", "one\nworse\nthree\n",
+                 [{"relevant_file": "a.py", "start_line": 2, "end_line": 2,
+                   "issue_header": "Bug", "issue_content": "still wrong"}])):
+            with self.subTest(new=new):
+                fake = self.start()
+                fake.contents = {("a.py", OLD): old, ("a.py", HEAD): new}
+                fake.threads = [self.thread()]
+                review = json.loads(json.dumps(CLEAN))
+                review["review"]["key_issues_to_review"] = issues
+                result = self.run_approve(fake, review)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(fake.threads[0]["isResolved"])
+
+    def test_a_thread_on_a_file_the_model_did_not_fully_review_stays_open(self):
+        fake = self.start()
+        fake.contents = {("a.py", OLD): "one\nbad\n", ("a.py", HEAD): "one\ngood\n"}
+        fake.threads = [self.thread()]
+        review = json.loads(json.dumps(CLEAN))
+        review["coverage"]["files_partially_reviewed"] = ["a.py"]
+        self.run_approve(fake, review)
+        self.assertFalse(fake.threads[0]["isResolved"])
+
+    def test_resolving_can_be_turned_off(self):
+        fake = self.start()
+        fake.contents = {("a.py", OLD): "one\nbad\n", ("a.py", HEAD): "one\ngood\n"}
+        fake.threads = [self.thread()]
+        env = self.api_env(fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=self.write_review(CLEAN),
+                           APPROVAL_EXCLUDED_PATHS="", RUNNER_TEMP=str(self.tmp),
+                           RUN_STARTED="2026-06-01T00:00:00Z", RESOLVE_FIXED_THREADS="false")
+        self.run_cli("approve", **env)
+        self.assertFalse(fake.threads[0]["isResolved"])
+
+
+class StaleDismissTests(ApiTestCase):
+    def test_an_approval_already_dismissed_does_not_stop_the_others(self):
+        fake = self.start(head_sha=HEAD, reviews=[review_record(404, BOT, "APPROVED", OLD),
+                                                  review_record(2, BOT, "APPROVED", OLD)])
+        fake.fail_dismissals = {404}
+        result = self.run_cli("stale", **self.api_env(fake, BOT_LOGIN=BOT))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        dismissed = [path for method, path, _ in fake.writes() if method == "PUT"]
+        self.assertEqual(dismissed, ["/repos/o/r/pulls/7/reviews/404/dismissals",
+                                     "/repos/o/r/pulls/7/reviews/2/dismissals"])
+
+
+class ConvergeWithoutCommentTests(ApiTestCase):
+    def test_a_failed_review_never_marks_its_head_as_seen(self):
+        fake = self.start()
+        env = self.api_env(fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD,
+                           REVIEW_JSON=self.write_review({"review": {"key_issues_to_review": "x"}}),
+                           APPROVAL_EXCLUDED_PATHS="", RESULT_COMMENT="true", RUNNER_TEMP=str(self.tmp),
+                           RUN_STARTED="2026-06-01T00:00:00Z")
+        self.run_cli("approve", **env)
+        self.assertNotIn("deepseek-review:head", fake.comments[0]["body"])
+
+    def test_without_a_result_comment_the_last_reviewed_head_comes_from_the_bots_reviews(self):
+        fake = self.start(reviews=[review_record(1, BOT, "COMMENTED", OLD),
+                                   review_record(2, BOT, "COMMENTED", HEAD)])
+        fake.contents = {("a.py", OLD): "same\n", ("a.py", HEAD): "same\nnew\n"}
+        review = json.loads(json.dumps(CLEAN))
+        review["review"].update(merge_recommendation="changes_required", key_issues_to_review=[
+            {"relevant_file": "a.py", "start_line": 1, "end_line": 1, "issue_header": "h", "issue_content": "c"}])
+        env = self.api_env(fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=self.write_review(review),
+                           APPROVAL_EXCLUDED_PATHS="", RESULT_COMMENT="false", RUNNER_TEMP=str(self.tmp),
+                           RUN_STARTED="2026-06-01T00:00:00Z")
+        result = self.run_cli("approve", **env)
+        self.assertIn("Approval result: approved", result.stdout)
 
 if __name__ == "__main__":
     unittest.main()

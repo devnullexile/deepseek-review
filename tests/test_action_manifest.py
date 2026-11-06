@@ -15,10 +15,15 @@ MANIFEST = Path(os.environ.get("ACTION_MANIFEST",
                                Path(__file__).resolve().parents[1] / "action.yml"))
 STEP_KEYS = {"name", "id", "if", "shell", "env", "run", "uses", "with"}
 COMMAND_ENV = {
-    "gate": {"ALLOWED_AUTHORS", "IGNORE_GLOBS", "GH_TOKEN", "MEMBERS_ONLY"},
+    "gate": {"ALLOWED_AUTHORS", "IGNORE_GLOBS", "GH_TOKEN", "MEMBERS_ONLY", "REVIEW_ON", "REVIEW_LABEL"},
     "head-sha": {"GH_TOKEN", "PR_NUMBER"},
     "approve": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN", "HEAD_SHA_BEFORE", "REVIEW_JSON",
-                "APPROVAL_EXCLUDED_PATHS", "APPROVE", "REQUEST_CHANGES"},
+                "APPROVAL_EXCLUDED_PATHS", "APPROVE", "REQUEST_CHANGES", "RESULT_COMMENT",
+                "CONVERGE", "RUN_STARTED", "RESOLVE_FIXED_THREADS"},
+    "data-files": {"GH_TOKEN", "PR_NUMBER", "IGNORE_GLOBS", "SKIP_DATA_FILES", "DATA_FILE_LINES",
+                   "APPROVAL_EXCLUDED_PATHS"},
+    "take-label": {"GH_TOKEN", "PR_NUMBER", "REVIEW_LABEL"},
+    "stale": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN", "APPROVE", "RESULT_COMMENT", "REVIEW_LABEL"},
 }
 
 
@@ -79,6 +84,22 @@ class ActionManifestTests(unittest.TestCase):
 
     def test_our_app_id_input_is_deprecated_in_favour_of_client_id(self):
         self.assertIn("client-id", self.manifest["inputs"]["app-id"].get("deprecationMessage", ""))
+
+    def test_the_review_reads_the_ignore_list_with_this_pull_requests_data_files(self):
+        [review_step] = [step for step in self.steps if "docker run" in step.get("run", "")]
+        self.assertEqual(review_step["env"]["IGNORE_GLOBS"], "${{ steps.data.outputs.ignore-globs }}")
+        ids = [step.get("id") for step in self.steps]
+        self.assertLess(ids.index("data"), self.steps.index(review_step))
+
+    def test_earlier_findings_get_more_room_than_pr_agents_default(self):
+        [review_step] = [step for step in self.steps if "docker run" in step.get("run", "")]
+        self.assertEqual(review_step["env"]["PR_REVIEWER__MAX_PREVIOUS_FINDINGS_CHARS"],
+                         "${{ inputs.max-previous-findings-chars }}")
+        self.assertGreater(int(self.manifest["inputs"]["max-previous-findings-chars"]["default"]), 8000)
+
+    def test_the_result_comment_is_kept_even_when_approval_is_off(self):
+        [approval] = [step for step in self.steps if step.get("id") == "approval"]
+        self.assertIn("inputs.result-comment == 'true'", approval["if"])
 
     def test_every_input_reference_is_declared(self):
         declared = set(self.manifest["inputs"])

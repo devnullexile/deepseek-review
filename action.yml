@@ -59,6 +59,64 @@ inputs:
       Ignored files are not reviewed and do not block approval.
     required: false
     default: ""
+  skip-data-files:
+    description: >-
+      Leave data files out of the model review: lock files, JSON Lines, CSV and minified files,
+      and JSON, YAML, XML or TOML files with more than data-file-lines added lines. They stay in
+      the pull request for a person to check, are listed in the result comment, and do not block
+      approval. A path in approval-excluded-paths is always reviewed.
+    required: false
+    default: "true"
+  data-file-lines:
+    description: Added lines above which a JSON, YAML, XML or TOML file counts as data.
+    required: false
+    default: "1000"
+  max-previous-findings-chars:
+    description: >-
+      Characters of earlier findings, and of the replies in their resolved threads, given to the
+      model so it does not raise them again in other words. pr-agent's own default is 8000; 0
+      turns it off.
+    required: false
+    default: "60000"
+  result-comment:
+    description: >-
+      Keep one comment up to date with what the bot decided on the latest review and every reason:
+      the merge recommendation, findings, files the model could not review, and skipped data files.
+    required: false
+    default: "true"
+  converge:
+    description: >-
+      After the first review of a pull request, block approval only on what the bot had not seen:
+      findings on lines added or changed since its last review, and its own earlier findings that
+      nobody resolved. A point raised again on code the bot already reviewed, after a person
+      answered and resolved it, no longer blocks, and the model's merge recommendation is advisory
+      when none of its findings blocks; with no finding at all it still blocks. Security concerns,
+      files not fully reviewed and paths a person approves still block. The first review of a pull
+      request is unchanged.
+    required: false
+    default: "true"
+  resolve-fixed-threads:
+    description: >-
+      Resolve the bot's own review threads that a later commit fixed: the lines the thread pointed
+      at were changed or removed, and the review of the new commit raised no finding there again.
+      The bot replies in the thread before it resolves it. A thread on a file the model could not
+      fully review stays open.
+    required: false
+    default: "true"
+  review-on:
+    description: >-
+      push reviews every new commit. label reviews a pull request when it is opened, reopened,
+      marked ready or retargeted, and later only when someone adds the review label; a new commit
+      then withdraws the bot's approval until the next review. The workflow must list the labeled
+      event type for the label to work.
+    required: false
+    default: push
+  review-label:
+    description: >-
+      Label that asks for a review of the latest commit, in either review-on mode. The bot removes
+      it when the review starts, so adding it again asks for another review.
+    required: false
+    default: review
   model:
     description: LiteLLM model name. deepseek/deepseek-flash is DeepSeek-V4.1-Flash on the official DeepSeek API.
     required: false
@@ -143,8 +201,35 @@ runs:
         ALLOWED_AUTHORS: ${{ inputs.allowed-authors }}
         IGNORE_GLOBS: ${{ inputs.ignore-globs }}
         MEMBERS_ONLY: ${{ inputs.members-only }}
+        REVIEW_ON: ${{ inputs.review-on }}
+        REVIEW_LABEL: ${{ inputs.review-label }}
         GH_TOKEN: ${{ steps.token.outputs.token }}
       run: python3 "$GITHUB_ACTION_PATH/scripts/review_gate.py" gate
+
+    # Removed at the start, so adding the label again asks for another review.
+    - name: Take the review label
+      if: steps.gate.outputs.label-requested == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.token }}
+        PR_NUMBER: ${{ steps.gate.outputs.pr-number }}
+        REVIEW_LABEL: ${{ inputs.review-label }}
+      run: python3 "$GITHUB_ACTION_PATH/scripts/review_gate.py" take-label
+
+    # In label mode a new commit is not reviewed, so an approval of older commits must not stay.
+    - name: Withdraw approval of older commits
+      if: >-
+        steps.gate.outputs.stale == 'true' && steps.token.outcome == 'success' &&
+        (inputs.approve == 'true' || inputs.result-comment == 'true')
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.token }}
+        PR_NUMBER: ${{ steps.gate.outputs.pr-number }}
+        BOT_LOGIN: ${{ steps.token.outputs.app-slug }}[bot]
+        APPROVE: ${{ inputs.approve }}
+        RESULT_COMMENT: ${{ inputs.result-comment }}
+        REVIEW_LABEL: ${{ inputs.review-label }}
+      run: python3 "$GITHUB_ACTION_PATH/scripts/review_gate.py" stale
 
     - name: Record reviewed head
       id: head
@@ -155,6 +240,19 @@ runs:
         PR_NUMBER: ${{ steps.gate.outputs.pr-number }}
       run: python3 "$GITHUB_ACTION_PATH/scripts/review_gate.py" head-sha
 
+    - name: Find data files
+      id: data
+      if: steps.gate.outputs.run == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.token }}
+        PR_NUMBER: ${{ steps.gate.outputs.pr-number }}
+        IGNORE_GLOBS: ${{ inputs.ignore-globs }}
+        SKIP_DATA_FILES: ${{ inputs.skip-data-files }}
+        DATA_FILE_LINES: ${{ inputs.data-file-lines }}
+        APPROVAL_EXCLUDED_PATHS: ${{ inputs.approval-excluded-paths }}
+      run: python3 "$GITHUB_ACTION_PATH/scripts/review_gate.py" data-files
+
     # pr-agent reads the diff through the GitHub API; pull request code is never checked out or run.
     - name: Review with DeepSeek
       if: steps.gate.outputs.run == 'true'
@@ -163,7 +261,8 @@ runs:
         PR_URL: ${{ steps.gate.outputs.pr-url }}
         PR_AGENT_IMAGE: ${{ inputs.pr-agent-image }}
         EXTRA_INSTRUCTIONS: ${{ inputs.extra-instructions }}
-        IGNORE_GLOBS: ${{ inputs.ignore-globs }}
+        # The user's globs plus this pull request's data files.
+        IGNORE_GLOBS: ${{ steps.data.outputs.ignore-globs }}
         REVIEW_ATTEMPTS: ${{ inputs.review-attempts }}
         RETRY_DELAY_SECONDS: ${{ inputs.retry-delay-seconds }}
         GITHUB__DEPLOYMENT_TYPE: user
@@ -189,6 +288,8 @@ runs:
         PR_REVIEWER__ENABLE_LARGE_PR_CHUNKING: "true"
         PR_REVIEWER__MAX_NUMBER_OF_CALLS: "3"
         PR_REVIEWER__NUM_MAX_FINDINGS: ${{ inputs.max-findings }}
+        # Earlier findings and the replies in their resolved threads, so they are not raised again.
+        PR_REVIEWER__MAX_PREVIOUS_FINDINGS_CHARS: ${{ inputs.max-previous-findings-chars }}
         PR_REVIEWER__PERSISTENT_COMMENT: "true"
         PR_REVIEWER__FINAL_UPDATE_MESSAGE: "false"
         PR_REVIEWER__ENABLE_REVIEW_LABELS_SECURITY: "false"
@@ -221,6 +322,9 @@ runs:
         fi
         case "$RETRY_DELAY_SECONDS" in
           ''|*[!0-9]*) echo "::error::retry-delay-seconds must be a whole number of seconds, not '$RETRY_DELAY_SECONDS'."; exit 2 ;;
+        esac
+        case "$PR_REVIEWER__MAX_PREVIOUS_FINDINGS_CHARS" in
+          ''|*[!0-9]*) echo "::error::max-previous-findings-chars must be a whole number, not '$PR_REVIEWER__MAX_PREVIOUS_FINDINGS_CHARS'."; exit 2 ;;
         esac
         out="$RUNNER_TEMP/deepseek-review"
         mkdir -p "$out"
@@ -272,7 +376,8 @@ runs:
     - name: Approve or request changes
       id: approval
       if: >-
-        !cancelled() && (inputs.approve == 'true' || inputs.request-changes == 'true') &&
+        !cancelled() &&
+        (inputs.approve == 'true' || inputs.request-changes == 'true' || inputs.result-comment == 'true') &&
         steps.gate.outputs.run == 'true' && steps.head.outcome == 'success'
       shell: bash
       env:
@@ -284,4 +389,8 @@ runs:
         APPROVAL_EXCLUDED_PATHS: ${{ inputs.approval-excluded-paths }}
         APPROVE: ${{ inputs.approve }}
         REQUEST_CHANGES: ${{ inputs.request-changes }}
+        RESULT_COMMENT: ${{ inputs.result-comment }}
+        CONVERGE: ${{ inputs.converge }}
+        RESOLVE_FIXED_THREADS: ${{ inputs.resolve-fixed-threads }}
+        RUN_STARTED: ${{ steps.head.outputs.started }}
       run: python3 "$GITHUB_ACTION_PATH/scripts/review_gate.py" approve

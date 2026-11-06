@@ -55,7 +55,7 @@ class ReviewStepTests(unittest.TestCase):
         self.bin = bin_dir
         self.calls = self.dir / "calls.txt"
 
-    def run_step(self, plan, attempts="2"):
+    def run_step(self, plan, attempts="2", previous="60000"):
         env = {
             "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
             "RUNNER_TEMP": str(self.dir),
@@ -66,6 +66,7 @@ class ReviewStepTests(unittest.TestCase):
             "IGNORE_GLOBS": "",
             "REVIEW_ATTEMPTS": attempts,
             "RETRY_DELAY_SECONDS": "0",
+            "PR_REVIEWER__MAX_PREVIOUS_FINDINGS_CHARS": previous,
             "FAKE_CALLS": str(self.calls),
             "FAKE_PLAN": ",".join(plan),
             "FAKE_REVIEW": json.dumps(GOOD),
@@ -132,6 +133,15 @@ class ReviewStepTests(unittest.TestCase):
                 result = self.run_step(["ok"], attempts=attempts)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(self.call_count, 0)
+
+    def test_an_invalid_previous_findings_size_is_refused_before_any_review(self):
+        for previous in ("", "-1", "lots"):
+            with self.subTest(previous=previous):
+                self.calls.unlink(missing_ok=True)
+                result = self.run_step(["ok"], previous=previous)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.call_count, 0)
+        self.assertEqual(self.run_step(["ok"], previous="0").returncode, 0)
 
     def test_defaults_retry_once(self):
         self.assertEqual(self.inputs["review-attempts"]["default"], "2")
