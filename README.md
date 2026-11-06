@@ -16,10 +16,18 @@ A GitHub Action that reviews pull requests with [pr-agent](https://github.com/qo
    - no changed file matches `approval-excluded-paths` (by default `.github/*`, so a person approves CI changes);
    - the head commit did not change while the review ran.
 
+   After the first review of a pull request, a later review converges (`converge`): only findings on lines added or changed since the bot's last review block, and so do the bot's own earlier threads that nobody resolved. A point raised again on code the bot already reviewed, after a person answered and resolved it, no longer blocks, and the model's merge recommendation is then advisory. Security concerns, files not fully reviewed and protected paths still block.
+
    The approval is pinned to the reviewed commit. In any other case, the bot withdraws (dismisses) its own earlier approvals. A failed review also withdraws them. Reviews by people are never touched.
 5. Optionally (`request-changes: "true"`), requests changes when the model's verdict is `changes_required`. A later approval by the bot supersedes the request. A later completed review with a softer verdict withdraws it. A failed review keeps it, so a merge that the request blocks stays blocked.
 
-6. Keeps one result comment up to date: what the bot decided on the latest commit and every reason, with the findings, the files the model could not review, and the data files a person should check. It is updated on each review, not repeated.
+6. Resolves its own threads that a later commit fixed (`resolve-fixed-threads`): the lines a thread pointed at were changed or removed, and the review of the new commit raised no finding there again. It replies in the thread first, saying which commit changed the lines.
+7. Keeps one result comment up to date with what the bot decided on the latest commit and a checklist of what to change before it approves:
+   - each blocking finding, with a link to its file and lines;
+   - each earlier thread that is still open, with a link to it;
+   - any other blocker, such as security concerns or files not fully reviewed.
+
+   Below the checklist it lists the findings that do not block, the data files a person should check, and the threads the bot resolved. It is updated on each review, not repeated.
 
 The approval is a signal, not a guarantee. A language model can miss defects, and the text of a pull request can try to manipulate it. Keep human review for anything that matters.
 
@@ -124,6 +132,8 @@ To review only members of the organization that owns the repository, set `member
 | `data-file-lines` | `1000` | Added lines above which a JSON, YAML, XML or TOML file counts as data |
 | `max-previous-findings-chars` | `60000` | Room for earlier findings and the replies in their resolved threads, so they are not raised again; pr-agent's own default is 8000, and `0` turns it off |
 | `result-comment` | `true` | Keep one comment with what the bot decided and why |
+| `converge` | `true` | After the first review, block only on findings on code changed since the last review and on the bot's own open threads |
+| `resolve-fixed-threads` | `true` | Resolve the bot's threads whose lines a later commit changed, when the new review raised nothing there again |
 | `review-on` | `push` | `push` reviews every commit; `label` reviews new commits only when the review label is added (see [Review on request](#review-on-request)) |
 | `review-label` | `review` | Label that asks for a review of the latest commit; the bot removes it when the review starts |
 | `model` | `deepseek/deepseek-flash` | LiteLLM model name; this is DeepSeek-V4.1-Flash |

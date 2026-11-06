@@ -487,5 +487,104 @@ class OtherEventTests(unittest.TestCase):
                         {"action": action}, trigger=trigger, label="review")
                     self.assertFalse(wanted or stale)
 
+
+class ConvergeTests(unittest.TestCase):
+    class Files:
+        def __init__(self, files):
+            self.files = files
+
+        def file_at(self, path, ref):
+            value = self.files.get((path, ref))
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+    def issue(self, path, start, end=None):
+        return {"relevant_file": path, "start_line": start, "end_line": end or start,
+                "issue_header": "h", "issue_content": "c"}
+
+    def test_changed_lines_are_the_added_and_replaced_ones(self):
+        self.assertEqual(review_gate.changed_lines("a\nb\nc\n", "a\nB\nc\nd\n"), {2, 4})
+        self.assertEqual(review_gate.changed_lines("a\nb\n", "a\nb\n"), set())
+
+    def test_only_findings_on_code_the_previous_review_had_not_seen_block(self):
+        client = self.Files({("a.py", OLD): "x\ny\nz\n", ("a.py", HEAD): "x\nY\nz\n",
+                             ("new.py", HEAD): "n\n"})
+        old_line, new_line = self.issue("a.py", 1), self.issue("a.py", 2)
+        new_file = self.issue("new.py", 1)
+        review = clean_review(key_issues_to_review=[old_line, new_line, new_file])
+        blocking = review_gate.blocking_findings(client, review, OLD, HEAD)
+        self.assertEqual(blocking, [new_line, new_file])
+
+    def test_a_finding_whose_code_cannot_be_read_blocks(self):
+        client = self.Files({("a.py", OLD): review_gate.GitHubError("rate limited")})
+        unreadable = self.issue("a.py", 1)
+        no_line = {"relevant_file": "b.py", "issue_header": "h", "issue_content": "c"}
+        review = clean_review(key_issues_to_review=[unreadable, no_line, "odd"])
+        self.assertEqual(len(review_gate.blocking_findings(client, review, OLD, HEAD)), 3)
+
+    def test_the_verdict_is_advisory_once_no_finding_blocks(self):
+        review = clean_review(merge_recommendation="changes_required",
+                              key_issues_to_review=[self.issue("a.py", 1)])
+        self.assertEqual(review_gate.approval_blockers(review, blocking_issues=[]), [])
+        blocked = review_gate.approval_blockers(review, blocking_issues=[self.issue("a.py", 1)])
+        self.assertIn("1 finding(s) on lines changed since the last review", blocked)
+
+    def test_security_and_coverage_still_block_a_converging_review(self):
+        review = clean_review(security_concerns="SQL injection")
+        review["coverage"]["files_not_reviewed"] = ["big.py"]
+        blocked = review_gate.approval_blockers(review, blocking_issues=[])
+        self.assertIn("security concerns reported", blocked)
+        self.assertIn("1 file(s) not reviewed", blocked)
+
+    def test_only_the_bots_own_open_threads_from_before_this_run_count(self):
+        class Threads:
+            def review_threads(self):
+                return [
+                    {"isResolved": False, "author": "bot", "created_at": "2026-01-01T00:00:00Z"},
+                    {"isResolved": True, "author": "bot", "created_at": "2026-01-01T00:00:00Z"},
+                    {"isResolved": False, "author": "alice", "created_at": "2026-01-01T00:00:00Z"},
+                    {"isResolved": False, "author": "bot", "created_at": "2026-02-01T00:00:00Z"}]
+        earlier = review_gate.open_earlier_findings(Threads(), "bot[bot]", "2026-01-15T00:00:00Z")
+        self.assertEqual(len(earlier), 1)
+
+    def test_the_comment_marks_findings_that_do_not_block_and_keeps_the_head(self):
+        old_line, new_line = self.issue("a.py", 1), self.issue("a.py", 2)
+        review = clean_review(key_issues_to_review=[old_line, new_line])
+        body = review_gate.result_comment(head_sha=HEAD, result="not-approved", review=review,
+                                          skipped=[], blockers=["x"], blocking=[new_line],
+                                          reviewed_head=HEAD)
+        todo, _, rest = body.partition("**Not blocking**")
+        self.assertIn("`a.py:2`", todo)
+        self.assertIn("`a.py:1`", rest)
+        self.assertNotIn("`a.py:1`", todo)
+        self.assertEqual(review_gate.HEAD_MARKER_RE.search(body).group(1), HEAD)
+
+    def test_the_checklist_links_each_finding_and_each_open_thread(self):
+        finding = {"relevant_file": "src/a b.py", "start_line": 3, "end_line": 5,
+                   "issue_header": "Bug", "issue_content": "wrong"}
+        review = clean_review(key_issues_to_review=[finding])
+        earlier = [{"path": "src/c.py", "original_end": 9,
+                    "url": "https://github.com/o/r/pull/7#discussion_r1"}]
+        body = review_gate.result_comment(
+            head_sha=HEAD, result="not-approved", review=review, skipped=["uv.lock"],
+            blockers=["1 key issue(s) reported", "1 earlier finding(s) of the bot are not resolved",
+                      "security concerns reported"],
+            earlier=earlier, repo_url="https://github.com/o/r")
+        self.assertIn(f"- [ ] Fix, or answer in its thread: [`src/a b.py:3`]"
+                      f"(https://github.com/o/r/blob/{HEAD}/src/a%20b.py#L3-L5)", body)
+        self.assertIn("[`src/c.py:9`](https://github.com/o/r/pull/7#discussion_r1)", body)
+        self.assertIn("- [ ] security concerns reported", body)
+        self.assertNotIn("- [ ] 1 key issue(s)", body)
+        self.assertIn("**For a person to check**", body)
+
+
+class TouchedTests(unittest.TestCase):
+    def test_a_replaced_or_removed_line_is_touched_and_a_shifted_one_is_not(self):
+        old = "a\nb\nc\n"
+        self.assertEqual(review_gate.touched(old, "a\nB\nc\n", 2, 2), (True, (2, 2)))
+        self.assertEqual(review_gate.touched(old, "a\nc\n", 2, 2)[0], True)
+        self.assertEqual(review_gate.touched(old, "x\na\nb\nc\n", 2, 2), (False, (3, 3)))
+
 if __name__ == "__main__":
     unittest.main()

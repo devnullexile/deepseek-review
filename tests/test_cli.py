@@ -29,6 +29,8 @@ class FakeGitHub:
         self.members = None if members is None else set(members)
         self.comments = []
         self.labels = {"review"}
+        self.threads = []  # {"isResolved", "author", "createdAt"}
+        self.contents = {}  # (path, ref) -> text
         self.requests = []
         fake = self
 
@@ -67,6 +69,14 @@ class FakeGitHub:
                 if self.path == "/repos/o/r/pulls/7":
                     return self._send(200, {"head": {"sha": fake.head_sha},
                                             "changed_files": len(fake.files)})
+                if self.path.startswith("/repos/o/r/contents/"):
+                    path, _, ref = self.path[len("/repos/o/r/contents/"):].partition("?ref=")
+                    text = fake.contents.get((path, ref))
+                    if text is None:
+                        return self._send(404, {"message": "Not Found"})
+                    import base64
+                    return self._send(200, {"encoding": "base64",
+                                            "content": base64.b64encode(text.encode()).decode()})
                 if self.path.startswith("/repos/o/r/issues/7/comments"):
                     return self._send(200, fake.comments)
                 if self.path.startswith("/repos/o/r/pulls/7/reviews"):
@@ -80,6 +90,24 @@ class FakeGitHub:
 
             def do_POST(self):
                 body = self._body()
+                if self.path == "/graphql" and body["query"].lstrip().startswith("mutation"):
+                    fake.requests.append(("POST", self.path, body, None))
+                    if "resolveReviewThread" in body["query"]:
+                        for thread in fake.threads:
+                            if thread.get("id") == body["variables"]["id"]:
+                                thread["isResolved"] = True
+                    return self._send(200, {"data": {}})
+                if self.path == "/graphql":
+                    fake.requests.append(("GET", self.path, body, None))  # A read.
+                    nodes = [{"id": t.get("id"), "isResolved": t["isResolved"], "path": t.get("path"),
+                              "line": t.get("line"), "originalLine": t.get("originalLine"),
+                              "originalStartLine": t.get("originalStartLine"),
+                              "comments": {"nodes": [
+                        {"author": {"login": t["author"]}, "createdAt": t["createdAt"],
+                         "originalCommit": {"oid": t.get("commit")}}]}}
+                        for t in fake.threads]
+                    return self._send(200, {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}}}}})
                 fake.requests.append(("POST", self.path, body, None))
                 if self.path == "/repos/o/r/issues/7/comments":
                     fake.comments.append({"id": len(fake.comments) + 1, "user": {"login": BOT},
@@ -201,7 +229,9 @@ class GateCommandTests(CliTestCase):
         self.assertIn("pull_request", result.stdout + result.stderr)
 
 
-class ApiCommandTests(CliTestCase):
+class ApiTestCase(CliTestCase):
+    """Helpers for commands that call the GitHub API; no tests of its own."""
+
     def api_env(self, fake, **extra):
         # The result comment has its own tests; the others check reviews only.
         return {"GITHUB_API_URL": fake.url, "GITHUB_REPOSITORY": "o/r", "PR_NUMBER": "7",
@@ -217,6 +247,8 @@ class ApiCommandTests(CliTestCase):
         path.write_text(json.dumps(payload))
         return str(path)
 
+
+class ApiCommandTests(ApiTestCase):
     def members_only_gate(self, fake, login, owner_type="Organization", draft=False, **env):
         event = self.tmp / "event.json"
         event.write_text(json.dumps({
@@ -276,7 +308,9 @@ class ApiCommandTests(CliTestCase):
         fake = self.start()
         result = self.run_cli("head-sha", **self.api_env(fake))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.outputs(), {"sha": HEAD})
+        outputs = self.outputs()
+        self.assertEqual(outputs["sha"], HEAD)
+        self.assertRegex(outputs["started"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         self.assertEqual(fake.requests[0][3], "Bearer secret-token")
 
     def test_approve_posts_an_approval_pinned_to_the_reviewed_commit(self):
@@ -366,7 +400,7 @@ class ApiCommandTests(CliTestCase):
 
 
 
-class NewCommandTests(ApiCommandTests):
+class NewCommandTests(ApiTestCase):
     def test_data_files_merges_the_users_globs_with_this_pull_requests_data(self):
         fake = self.start(files=[
             {"filename": "uv.lock", "additions": 3, "changes": 3, "patch": "@@"},
@@ -454,7 +488,7 @@ class LabelModeGateTests(CliTestCase):
                 self.assertEqual(self.outputs(), {"run": "false"})
 
 
-class StaleAndValidationTests(ApiCommandTests):
+class StaleAndValidationTests(ApiTestCase):
     def test_a_stale_run_keeps_an_approval_of_the_current_head(self):
         fake = self.start(head_sha=HEAD, reviews=[review_record(1, BOT, "APPROVED", OLD),
                                                   review_record(2, BOT, "APPROVED", HEAD)])
@@ -476,7 +510,7 @@ class StaleAndValidationTests(ApiCommandTests):
         self.assertEqual(fake.writes(), [])
 
 
-class LateEventTests(ApiCommandTests):
+class LateEventTests(ApiTestCase):
     def test_a_stale_run_after_a_review_of_the_current_head_changes_nothing(self):
         fake = self.start(head_sha=HEAD, reviews=[review_record(1, BOT, "APPROVED", OLD),
                                                   review_record(2, BOT, "CHANGES_REQUESTED", HEAD)])
@@ -501,6 +535,133 @@ class TakeLabelFailureTests(CliTestCase):
         result = self.run_cli("take-label", **env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("could not remove", result.stdout)
+
+
+class ConvergeCommandTests(ApiTestCase):
+    FINDING = {"relevant_file": "a.py", "start_line": 1, "end_line": 1,
+               "issue_header": "Possible Bug", "issue_content": "raised again"}
+
+    def review_with_finding(self):
+        review = json.loads(json.dumps(CLEAN))
+        review["review"]["merge_recommendation"] = "changes_required"
+        review["review"]["key_issues_to_review"] = [self.FINDING]
+        return self.write_review(review)
+
+    def approve(self, fake, **extra):
+        env = self.api_env(fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=self.review_with_finding(),
+                           APPROVAL_EXCLUDED_PATHS="", RESULT_COMMENT="true", RUNNER_TEMP=str(self.tmp),
+                           RUN_STARTED="2026-06-01T00:00:00Z", REQUEST_CHANGES="true", **extra)
+        return self.run_cli("approve", **env)
+
+    def seen_before(self, fake):
+        fake.comments.append({"id": 1, "user": {"login": BOT},
+                              "body": f"<!-- deepseek-review:result -->\n<!-- deepseek-review:head {OLD} -->"})
+        fake.contents = {("a.py", OLD): "same\n", ("a.py", HEAD): "same\nnew\n"}
+
+    def test_the_first_review_stays_strict(self):
+        fake = self.start()
+        result = self.approve(fake)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("changes-requested", result.stdout)
+
+    def test_a_point_raised_again_on_reviewed_code_does_not_block_once_answered(self):
+        fake = self.start()
+        self.seen_before(fake)
+        fake.threads = [{"isResolved": True, "author": BOT.removesuffix("[bot]"),
+                         "createdAt": "2026-05-01T00:00:00Z"}]
+        result = self.approve(fake)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Approval result: approved", result.stdout)
+        self.assertIn("**Not blocking**", fake.comments[0]["body"])
+
+    def test_an_unanswered_earlier_finding_still_blocks(self):
+        fake = self.start()
+        self.seen_before(fake)
+        fake.threads = [{"isResolved": False, "author": BOT.removesuffix("[bot]"),
+                         "createdAt": "2026-05-01T00:00:00Z"}]
+        result = self.approve(fake)
+        self.assertIn("earlier finding(s) of the bot are not resolved", result.stdout)
+        self.assertNotIn("Approval result: approved", result.stdout)
+        # Only the old point is open, so changes are not requested.
+        self.assertNotIn("changes-requested", result.stdout)
+
+    def test_a_finding_on_changed_code_blocks_and_asks_for_changes(self):
+        fake = self.start()
+        self.seen_before(fake)
+        finding = dict(self.FINDING, start_line=2, end_line=2)
+        review = json.loads(json.dumps(CLEAN))
+        review["review"].update(merge_recommendation="changes_required", key_issues_to_review=[finding])
+        env = self.api_env(fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=self.write_review(review),
+                           APPROVAL_EXCLUDED_PATHS="", RESULT_COMMENT="true", RUNNER_TEMP=str(self.tmp),
+                           RUN_STARTED="2026-06-01T00:00:00Z", REQUEST_CHANGES="true")
+        result = self.run_cli("approve", **env)
+        self.assertIn("lines changed since the last review", result.stdout)
+        self.assertIn("changes-requested", result.stdout)
+
+    def test_converge_can_be_turned_off(self):
+        fake = self.start()
+        self.seen_before(fake)
+        result = self.approve(fake, CONVERGE="false")
+        self.assertIn("changes-requested", result.stdout)
+
+
+class ResolveFixedThreadTests(ApiTestCase):
+    def run_approve(self, fake, review):
+        env = self.api_env(fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=self.write_review(review),
+                           APPROVAL_EXCLUDED_PATHS="", RESULT_COMMENT="true", RUNNER_TEMP=str(self.tmp),
+                           RUN_STARTED="2026-06-01T00:00:00Z")
+        return self.run_cli("approve", **env)
+
+    def thread(self, line=2):
+        return {"id": "T1", "isResolved": False, "author": BOT.removesuffix("[bot]"),
+                "createdAt": "2026-05-01T00:00:00Z", "path": "a.py", "originalLine": line,
+                "originalStartLine": None, "commit": OLD}
+
+    def test_a_thread_whose_lines_a_commit_changed_is_resolved_and_then_counts_as_answered(self):
+        fake = self.start()
+        fake.contents = {("a.py", OLD): "one\nbad\nthree\n", ("a.py", HEAD): "one\ngood\nthree\n"}
+        fake.threads = [self.thread()]
+        result = self.run_approve(fake, CLEAN)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(fake.threads[0]["isResolved"])
+        replies = [b for m, p, b in fake.writes() if p == "/graphql" and "Reply" in b["query"]]
+        self.assertIn("changed in `ccccccc`", replies[0]["variables"]["body"])
+        self.assertIn("resolved 1 earlier thread", fake.comments[0]["body"])
+
+    def test_a_thread_on_untouched_lines_or_raised_again_stays_open(self):
+        for old, new, issues in (
+                ("one\nbad\nthree\n", "zero\none\nbad\nthree\n", []),  # Only shifted.
+                ("one\nbad\nthree\n", "one\nworse\nthree\n",
+                 [{"relevant_file": "a.py", "start_line": 2, "end_line": 2,
+                   "issue_header": "Bug", "issue_content": "still wrong"}])):
+            with self.subTest(new=new):
+                fake = self.start()
+                fake.contents = {("a.py", OLD): old, ("a.py", HEAD): new}
+                fake.threads = [self.thread()]
+                review = json.loads(json.dumps(CLEAN))
+                review["review"]["key_issues_to_review"] = issues
+                result = self.run_approve(fake, review)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(fake.threads[0]["isResolved"])
+
+    def test_a_thread_on_a_file_the_model_did_not_fully_review_stays_open(self):
+        fake = self.start()
+        fake.contents = {("a.py", OLD): "one\nbad\n", ("a.py", HEAD): "one\ngood\n"}
+        fake.threads = [self.thread()]
+        review = json.loads(json.dumps(CLEAN))
+        review["coverage"]["files_partially_reviewed"] = ["a.py"]
+        self.run_approve(fake, review)
+        self.assertFalse(fake.threads[0]["isResolved"])
+
+    def test_resolving_can_be_turned_off(self):
+        fake = self.start()
+        fake.contents = {("a.py", OLD): "one\nbad\n", ("a.py", HEAD): "one\ngood\n"}
+        fake.threads = [self.thread()]
+        env = self.api_env(fake, BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=self.write_review(CLEAN),
+                           APPROVAL_EXCLUDED_PATHS="", RUNNER_TEMP=str(self.tmp),
+                           RUN_STARTED="2026-06-01T00:00:00Z", RESOLVE_FIXED_THREADS="false")
+        self.run_cli("approve", **env)
+        self.assertFalse(fake.threads[0]["isResolved"])
 
 if __name__ == "__main__":
     unittest.main()

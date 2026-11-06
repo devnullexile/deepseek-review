@@ -84,6 +84,24 @@ inputs:
       the merge recommendation, findings, files the model could not review, and skipped data files.
     required: false
     default: "true"
+  converge:
+    description: >-
+      After the first review of a pull request, block approval only on what the bot had not seen:
+      findings on lines added or changed since its last review, and its own earlier findings that
+      nobody resolved. A point raised again on code the bot already reviewed, after a person
+      answered and resolved it, no longer blocks, and the model's merge recommendation is then
+      advisory. Security concerns, files not fully reviewed and paths a person approves still
+      block. The first review of a pull request is unchanged.
+    required: false
+    default: "true"
+  resolve-fixed-threads:
+    description: >-
+      Resolve the bot's own review threads that a later commit fixed: the lines the thread pointed
+      at were changed or removed, and the review of the new commit raised no finding there again.
+      The bot replies in the thread before it resolves it. A thread on a file the model could not
+      fully review stays open.
+    required: false
+    default: "true"
   review-on:
     description: >-
       push reviews every new commit. label reviews a pull request when it is opened, reopened,
@@ -371,4 +389,7 @@ runs:
         APPROVE: ${{ inputs.approve }}
         REQUEST_CHANGES: ${{ inputs.request-changes }}
         RESULT_COMMENT: ${{ inputs.result-comment }}
+        CONVERGE: ${{ inputs.converge }}
+        RESOLVE_FIXED_THREADS: ${{ inputs.resolve-fixed-threads }}
+        RUN_STARTED: ${{ steps.head.outputs.started }}
       run: python3 "$GITHUB_ACTION_PATH/scripts/review_gate.py" approve
