@@ -37,12 +37,15 @@ class SamePointTests(unittest.TestCase):
     def test_a_title_in_other_words_is_the_same_point(self):
         for one, other in (("Duplicate asset IDs", "Duplicate asset IDs"),
                            ("Dataset Version Mismatch", "Dataset ID mismatch"),
-                           ("Locale-dependent JSONL", "Locale-dependent decode")):
+                           ("Redaction bypass", "Redaction bypass found")):
             with self.subTest(one=one):
                 self.assertTrue(review_gate.same_point(one, other))
 
     def test_generic_or_different_titles_are_not(self):
         for one, other in (("Possible Issue", "Possible Bug"), ("Redaction bypass", "Secret redaction miss"),
+                           # Half the words in common is a shared topic, not the same point.
+                           ("SQL injection in search", "SQL injection in export"),
+                           ("Locale-dependent JSONL", "Locale-dependent decode"),
                            ("", "Duplicate asset IDs"), ("Duplicate asset IDs", None)):
             with self.subTest(one=one):
                 self.assertFalse(review_gate.same_point(one, other))
@@ -333,6 +336,17 @@ class LoopCommandTests(ApiTestCase):
         result = self.run_cli("head-sha", **self.api_env(fake, BOT_LOGIN=BOT))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.outputs()["reviews"], "2")
+
+    def test_reviews_that_cannot_be_listed_leave_the_count_unknown_not_the_step_failed(self):
+        class Failing:
+            def list_comments(self):
+                return [{"user": {"login": BOT}, "body": f"<!-- deepseek-review:result -->\n"
+                                                         f"<!-- deepseek-review:head {OLD} -->"}]
+
+            def list_reviews(self):
+                raise review_gate.GitHubError("HTTP 502", status=502)
+        self.assertEqual(review_gate.earlier_state(Failing(), BOT, HEAD),
+                         {"head": OLD, "reviews": 0, "advisory": set()})
 
     def test_a_stale_run_keeps_the_count_and_the_advisory_threads(self):
         fake = self.start()

@@ -43,7 +43,8 @@ ADVISORY_MARKER_RE = re.compile(r"<!-- deepseek-review:advisory ([A-Za-z0-9_=\- 
 GENERIC_TITLE_WORDS = frozenset({
     "possible", "potential", "issue", "issues", "bug", "bugs", "problem", "problems", "concern",
     "concerns", "risk", "error", "errors", "the", "and", "for", "with", "not", "from", "into"})
-# Two titles of one file make the same point when this share of their words is common to both.
+# Two titles of one file make the same point when more than this share of their words is common
+# to both; exactly half is a shared topic, such as "SQL injection in search" and "... in export".
 SAME_POINT_SHARE = 0.5
 # File names given to the model as left out of its view; more are counted, not named.
 MAX_LEFT_OUT_NAMED = 40
@@ -415,7 +416,13 @@ def earlier_state(client, bot_login, head=""):
     """
     state = parse_state((_own_result(client, bot_login) or {}).get("body"))
     if not state["head"] or not state["reviews"]:
-        earlier = [record.get("commit_id") for record in client.list_reviews()
+        try:
+            records = client.list_reviews()
+        except (GitHubError, OSError) as error:
+            # An unknown head keeps the review strict, and an unknown count sets no limit.
+            print(f"::warning::Earlier reviews could not be listed ({error}).")
+            records = []
+        earlier = [record.get("commit_id") for record in records
                    if (record.get("user") or {}).get("login") == bot_login
                    and record.get("commit_id") and record.get("commit_id") != head]
         if not state["head"] and earlier:
@@ -629,7 +636,7 @@ def same_point(title, other):
     words, others = _title_words(title), _title_words(other)
     if not words or not others:
         return False
-    return len(words & others) / len(words | others) >= SAME_POINT_SHARE
+    return len(words & others) / len(words | others) > SAME_POINT_SHARE
 
 
 def repeated_findings(issues, threads, *, bot_login, started):
