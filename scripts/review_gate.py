@@ -593,16 +593,23 @@ def command_data_files():
 
 def command_stale():
     """After new commits in label mode: withdraw the bot's approval of older commits, and say so."""
+    approve, comment = _true("APPROVE", "true"), _true("RESULT_COMMENT", "true")
     client = _client_from_env()
     bot_login = os.environ["BOT_LOGIN"]
     label = os.environ.get("REVIEW_LABEL", "review").strip()
-    if _true("APPROVE", "true"):
-        for record in client.list_reviews():
-            if ((record.get("user") or {}).get("login") == bot_login
-                    and record.get("state") == "APPROVED"):
-                client.dismiss(record["id"], "New commits are not reviewed yet; "
-                                             f"add the {label!r} label to review them.")
-    if _true("RESULT_COMMENT", "true"):
+    head = client.head_sha()
+    approvals = [record for record in client.list_reviews()
+                 if (record.get("user") or {}).get("login") == bot_login
+                 and record.get("state") == "APPROVED"]
+    # Events can arrive late: a review of the current head may already have approved it.
+    if any(record.get("commit_id") == head for record in approvals):
+        print("The current head is already approved; nothing is stale.")
+        return
+    if approve:
+        for record in approvals:
+            client.dismiss(record["id"], "New commits are not reviewed yet; "
+                                         f"add the {label!r} label to review them.")
+    if comment:
         post_result(client, bot_login, stale_comment(label))
 
 
@@ -621,11 +628,13 @@ def _skipped_data_files():
 
 
 def command_approve():
+    # Every flag is checked before any change, so a bad value changes nothing.
+    approve = _true("APPROVE", "true")
+    request_changes = _true("REQUEST_CHANGES", "false")
+    comment = _true("RESULT_COMMENT", "true")
     client = _client_from_env()
     review = _load_review(os.environ["REVIEW_JSON"])
     excluded = _split_list(os.environ.get("APPROVAL_EXCLUDED_PATHS", DEFAULT_EXCLUDED_PATHS))
-    approve = _true("APPROVE", "true")
-    request_changes = _true("REQUEST_CHANGES", "false")
     skipped = _skipped_data_files()
     head_sha_before = os.environ.get("HEAD_SHA_BEFORE", "")
     head_sha_after = client.head_sha()
@@ -645,7 +654,7 @@ def command_approve():
             blockers = decision_blockers(client, review, excluded)
     print(f"Approval result: {result}")
     _set_outputs(result=result)
-    if _true("RESULT_COMMENT", "true"):
+    if comment:
         post_result(client, os.environ["BOT_LOGIN"], result_comment(
             head_sha=head_sha_after, result=result, blockers=blockers, review=review,
             skipped=skipped))

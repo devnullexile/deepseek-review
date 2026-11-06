@@ -453,5 +453,27 @@ class LabelModeGateTests(CliTestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.outputs(), {"run": "false"})
 
+
+class StaleAndValidationTests(ApiCommandTests):
+    def test_a_stale_run_keeps_an_approval_of_the_current_head(self):
+        fake = self.start(head_sha=HEAD, reviews=[review_record(1, BOT, "APPROVED", OLD),
+                                                  review_record(2, BOT, "APPROVED", HEAD)])
+        result = self.run_cli("stale", **self.api_env(fake, BOT_LOGIN=BOT, RESULT_COMMENT="true"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The current head is already approved, so nothing is stale and nothing changes.
+        self.assertEqual(fake.writes(), [])
+
+    def test_an_invalid_flag_is_refused_before_any_change(self):
+        fake = self.start(reviews=[review_record(1, BOT, "APPROVED", OLD)])
+        review = self.write_review(CLEAN)
+        for command, env in (("stale", dict(BOT_LOGIN=BOT, RESULT_COMMENT="yes")),
+                             ("approve", dict(BOT_LOGIN=BOT, HEAD_SHA_BEFORE=HEAD, REVIEW_JSON=review,
+                                              APPROVAL_EXCLUDED_PATHS="", RESULT_COMMENT="False"))):
+            with self.subTest(command=command):
+                result = self.run_cli(command, **self.api_env(fake, **env))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("result-comment", result.stdout + result.stderr)
+        self.assertEqual(fake.writes(), [])
+
 if __name__ == "__main__":
     unittest.main()
