@@ -9,6 +9,7 @@ import os
 import posixpath
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -263,6 +264,8 @@ def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None
     decision covers, kept for the next review. repo_url, when set, links files and threads.
     """
     title = RESULT_TITLES.get(result, "Not approved")
+    if result == "" and blockers:  # Comment-only mode: the title follows the blockers.
+        title = "Not approved"
     lines = [RESULT_MARKER]
     if reviewed_head:
         lines.append(f"<!-- deepseek-review:head {reviewed_head} -->")
@@ -620,6 +623,7 @@ class GitHubClient:
         self.api_url = api_url.rstrip("/")
         self.token = token
         self.repository, self.number = repository, number
+        self.retry_delay = float(os.environ.get("REVIEW_API_RETRY_DELAY", "1"))
         self.repo_path = f"/repos/{repository}"
         # GitHub Enterprise serves REST at /api/v3 and GraphQL at /api/graphql.
         root = self.api_url[: -len("/v3")] if self.api_url.endswith("/api/v3") else self.api_url
@@ -628,10 +632,31 @@ class GitHubClient:
         self.issue_path = f"/repos/{repository}/issues/{number}"
         self.comments_path = f"/repos/{repository}/issues/comments"
 
+    # GitHub answers these when it is briefly unavailable or rate limits; a retry usually works.
+    RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+    attempts = 3
+
     def _request(self, method, url, payload=None):
+        """One API call. A call that is safe to repeat is tried again after a temporary failure;
+        a POST that creates something, such as a comment or a review, never is."""
         if url.startswith("/"):
             url = self.api_url + url
         data = json.dumps(payload).encode() if payload is not None else None
+        query = (payload or {}).get("query", "") if isinstance(payload, dict) else ""
+        repeatable = method in ("GET", "PUT", "PATCH", "DELETE") or (
+            method == "POST" and url == self.graphql_url and not query.lstrip().startswith("mutation"))
+        for attempt in range(1, (self.attempts if repeatable else 1) + 1):
+            try:
+                return self._send(method, url, data)
+            except GitHubError as error:
+                if attempt == self.attempts or not repeatable or error.status not in self.RETRY_STATUSES:
+                    raise
+            except OSError:
+                if attempt == self.attempts or not repeatable:
+                    raise
+            time.sleep(self.retry_delay * attempt)
+
+    def _send(self, method, url, data):
         request = urllib.request.Request(url, data=data, method=method, headers={
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {self.token}",
@@ -932,9 +957,17 @@ def command_stale():
         return
     approvals = [record for record in mine if record.get("state") == "APPROVED"]
     if approve:
+        failures = []
         for record in approvals:
-            client.dismiss(record["id"], "New commits are not reviewed yet; "
-                                         f"add the {label!r} label to review them.")
+            try:
+                client.dismiss(record["id"], "New commits are not reviewed yet; "
+                                             f"add the {label!r} label to review them.")
+            except GitHubError as error:
+                if error.status in (404, 422):  # Already dismissed, for example by a person.
+                    continue
+                failures.append(error)  # Try the others first.
+        if failures:
+            raise failures[0]
     if comment:
         post_result(client, bot_login, stale_comment(label, previous_head(client, bot_login)))
 

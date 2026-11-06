@@ -133,6 +133,9 @@ class FakeGitHub:
 
             def do_PUT(self):
                 fake.requests.append(("PUT", self.path, self._body(), None))
+                review_id = int(self.path.split("/reviews/")[1].split("/")[0]) if "/reviews/" in self.path else 0
+                if review_id in getattr(fake, "fail_dismissals", set()):
+                    return self._send(422, {"message": "Can not dismiss a dismissed review"})
                 self._send(200, {})
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -235,7 +238,8 @@ class ApiTestCase(CliTestCase):
     def api_env(self, fake, **extra):
         # The result comment has its own tests; the others check reviews only.
         return {"GITHUB_API_URL": fake.url, "GITHUB_REPOSITORY": "o/r", "PR_NUMBER": "7",
-                "GH_TOKEN": "secret-token", "RESULT_COMMENT": "false", **extra}
+                "GH_TOKEN": "secret-token", "RESULT_COMMENT": "false", "REVIEW_API_RETRY_DELAY": "0",
+                **extra}
 
     def start(self, head_sha=HEAD, reviews=(), files=(), members=()):
         fake = FakeGitHub(head_sha, list(reviews), files, members)
@@ -531,7 +535,7 @@ class LateEventTests(ApiTestCase):
 class TakeLabelFailureTests(CliTestCase):
     def test_a_label_that_cannot_be_removed_does_not_stop_the_review(self):
         env = {"GITHUB_API_URL": "http://127.0.0.1:9", "GITHUB_REPOSITORY": "o/r", "PR_NUMBER": "7",
-               "GH_TOKEN": "t", "REVIEW_LABEL": "review"}
+               "GH_TOKEN": "t", "REVIEW_LABEL": "review", "REVIEW_API_RETRY_DELAY": "0"}
         result = self.run_cli("take-label", **env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("could not remove", result.stdout)
@@ -662,6 +666,18 @@ class ResolveFixedThreadTests(ApiTestCase):
                            RUN_STARTED="2026-06-01T00:00:00Z", RESOLVE_FIXED_THREADS="false")
         self.run_cli("approve", **env)
         self.assertFalse(fake.threads[0]["isResolved"])
+
+
+class StaleDismissTests(ApiTestCase):
+    def test_an_approval_already_dismissed_does_not_stop_the_others(self):
+        fake = self.start(head_sha=HEAD, reviews=[review_record(404, BOT, "APPROVED", OLD),
+                                                  review_record(2, BOT, "APPROVED", OLD)])
+        fake.fail_dismissals = {404}
+        result = self.run_cli("stale", **self.api_env(fake, BOT_LOGIN=BOT))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        dismissed = [path for method, path, _ in fake.writes() if method == "PUT"]
+        self.assertEqual(dismissed, ["/repos/o/r/pulls/7/reviews/404/dismissals",
+                                     "/repos/o/r/pulls/7/reviews/2/dismissals"])
 
 if __name__ == "__main__":
     unittest.main()

@@ -586,5 +586,47 @@ class TouchedTests(unittest.TestCase):
         self.assertEqual(review_gate.touched(old, "a\nc\n", 2, 2)[0], True)
         self.assertEqual(review_gate.touched(old, "x\na\nb\nc\n", 2, 2), (False, (3, 3)))
 
+
+class RetryTests(unittest.TestCase):
+    def client(self, answers):
+        client = review_gate.GitHubClient("http://example.invalid", "t", "o/r", 7)
+        client.retry_delay = 0
+        calls = []
+
+        def once(method, url, data):
+            calls.append(method)
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        client._send = once
+        return client, calls
+
+    def test_a_temporary_error_is_retried_for_a_request_that_can_repeat(self):
+        client, calls = self.client([review_gate.GitHubError("busy", status=502), ({"ok": 1}, "", 200)])
+        self.assertEqual(client._request("GET", "/x")[0], {"ok": 1})
+        self.assertEqual(calls, ["GET", "GET"])
+
+    def test_a_comment_is_never_posted_twice(self):
+        client, calls = self.client([review_gate.GitHubError("busy", status=502)])
+        with self.assertRaises(review_gate.GitHubError):
+            client._request("POST", "/repos/o/r/issues/7/comments", {"body": "x"})
+        self.assertEqual(calls, ["POST"])
+
+    def test_a_lasting_error_is_raised_after_the_last_attempt(self):
+        client, calls = self.client([review_gate.GitHubError("busy", status=503)] * 3)
+        with self.assertRaises(review_gate.GitHubError):
+            client._request("GET", "/x")
+        self.assertEqual(len(calls), 3)
+
+
+class CommentOnlyTitleTests(unittest.TestCase):
+    def test_a_failed_review_is_never_titled_reviewed(self):
+        body = review_gate.result_comment(head_sha=HEAD, result="", review=None, skipped=[],
+                                          blockers=["review output is missing or malformed"])
+        self.assertIn("Not approved", body)
+        self.assertNotIn("Reviewed", body.splitlines()[1])
+
 if __name__ == "__main__":
     unittest.main()
