@@ -477,5 +477,15 @@ class EditedEventTests(unittest.TestCase):
                 self.assertTrue(review_gate.review_wanted(retarget, trigger=trigger, label="review")[0])
                 self.assertFalse(review_gate.review_wanted(title, trigger=trigger, label="review")[0])
 
+
+class OtherEventTests(unittest.TestCase):
+    def test_only_the_documented_events_start_a_review(self):
+        for action in ("unlabeled", "assigned", "review_requested", "converted_to_draft", "closed"):
+            for trigger in ("push", "label"):
+                with self.subTest(action=action, trigger=trigger):
+                    wanted, stale, _, _ = review_gate.review_wanted(
+                        {"action": action}, trigger=trigger, label="review")
+                    self.assertFalse(wanted or stale)
+
 if __name__ == "__main__":
     unittest.main()

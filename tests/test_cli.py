@@ -475,5 +475,23 @@ class StaleAndValidationTests(ApiCommandTests):
                 self.assertIn("result-comment", result.stdout + result.stderr)
         self.assertEqual(fake.writes(), [])
 
+
+class LateEventTests(ApiCommandTests):
+    def test_a_stale_run_after_a_review_of_the_current_head_changes_nothing(self):
+        fake = self.start(head_sha=HEAD, reviews=[review_record(1, BOT, "APPROVED", OLD),
+                                                  review_record(2, BOT, "CHANGES_REQUESTED", HEAD)])
+        result = self.run_cli("stale", **self.api_env(fake, BOT_LOGIN=BOT, RESULT_COMMENT="true"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(fake.writes(), [])
+
+    def test_data_files_falls_back_to_the_users_globs_when_github_fails(self):
+        fake = self.start()
+        env = self.api_env(fake, IGNORE_GLOBS='["*.meta"]', RUNNER_TEMP=str(self.tmp))
+        env["GITHUB_API_URL"] = "http://127.0.0.1:9"  # Nothing listens: the listing fails.
+        result = self.run_cli("data-files", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.outputs()["ignore-globs"]), ["*.meta"])
+        self.assertIn("could not list", result.stdout)
+
 if __name__ == "__main__":
     unittest.main()

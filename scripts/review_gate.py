@@ -29,6 +29,9 @@ STRUCTURED_DATA_SUFFIXES = (".json", ".yaml", ".yml", ".xml", ".toml")
 MAX_IGNORE_CHARS = 100_000
 RESULT_MARKER = "<!-- deepseek-review:result -->"
 REVIEW_TRIGGERS = ("push", "label")
+# The pull request events that can ask for a review; any other, such as the bot removing its own
+# label (unlabeled), starts none. A payload without an action is treated as before: reviewed.
+REVIEW_ACTIONS = frozenset({"opened", "reopened", "ready_for_review", "synchronize", "edited", None})
 
 
 def author_allowed(pull_request, allowed_authors, is_member=None):
@@ -177,6 +180,8 @@ def review_wanted(event, *, trigger, label):
         if name == label.strip().lower():
             return True, False, True, f"the {label!r} label asks for a review"
         return False, False, False, f"the {name!r} label does not ask for a review"
+    if action not in REVIEW_ACTIONS:
+        return False, False, False, f"a pull request {action!r} event asks for no review"
     if action == "edited" and not (event.get("changes") or {}).get("base"):
         return False, False, False, "a title or description edit asks for no review"
     if trigger == "label" and action == "synchronize":
@@ -576,7 +581,14 @@ def command_data_files():
     if _true("SKIP_DATA_FILES", "true"):
         max_lines = _positive_int("data-file-lines", os.environ.get("DATA_FILE_LINES", "1000"))
         protected = _split_list(os.environ.get("APPROVAL_EXCLUDED_PATHS", DEFAULT_EXCLUDED_PATHS))
-        found = data_files(_client_from_env().list_files(), max_lines=max_lines, protected=protected)
+        try:
+            listed = _client_from_env().list_files()
+        except (GitHubError, OSError) as error:
+            # This step only helps the review; a GitHub hiccup must not stop it.
+            print(f"::warning::Data files could not be found, so every file is reviewed: could not list "
+                  f"the changed files ({error}).")
+            listed = []
+        found = data_files(listed, max_lines=max_lines, protected=protected)
         globs, skipped = ignore_list(user_globs, found)
         if len(skipped) < len(found):
             print(f"{len(found) - len(skipped)} more data file(s) are reviewed: the ignore list is full.")
@@ -598,13 +610,13 @@ def command_stale():
     bot_login = os.environ["BOT_LOGIN"]
     label = os.environ.get("REVIEW_LABEL", "review").strip()
     head = client.head_sha()
-    approvals = [record for record in client.list_reviews()
-                 if (record.get("user") or {}).get("login") == bot_login
-                 and record.get("state") == "APPROVED"]
-    # Events can arrive late: a review of the current head may already have approved it.
-    if any(record.get("commit_id") == head for record in approvals):
-        print("The current head is already approved; nothing is stale.")
+    mine = [record for record in client.list_reviews()
+            if (record.get("user") or {}).get("login") == bot_login]
+    # Events can arrive late: the current head may already be reviewed, whatever the verdict.
+    if any(record.get("commit_id") == head for record in mine):
+        print("The current head is already reviewed; nothing is stale.")
         return
+    approvals = [record for record in mine if record.get("state") == "APPROVED"]
     if approve:
         for record in approvals:
             client.dismiss(record["id"], "New commits are not reviewed yet; "
