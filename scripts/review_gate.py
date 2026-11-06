@@ -177,6 +177,8 @@ def review_wanted(event, *, trigger, label):
         if name == label.strip().lower():
             return True, False, True, f"the {label!r} label asks for a review"
         return False, False, False, f"the {name!r} label does not ask for a review"
+    if action == "edited" and not (event.get("changes") or {}).get("base"):
+        return False, False, False, "a title or description edit asks for no review"
     if trigger == "label" and action == "synchronize":
         return False, True, False, f"new commits are reviewed when someone adds the {label!r} label"
     return True, False, False, f"the pull request was {action or 'updated'}"
@@ -189,8 +191,18 @@ def _one_line(text, limit):
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def _text(text, limit):
+    """Untrusted text as plain text: no link, image, emphasis, code span or HTML of its own."""
+    return re.sub(r"([\\`*\[\]<>])", r"\\\1", _one_line(text, limit))
+
+
+def _code(text, limit):
+    """Untrusted text as one code span it cannot leave."""
+    return "`" + _one_line(text, limit).replace("`", "\u02bc") + "`"
+
+
 def _listed(names, limit=10):
-    shown = [f"`{_one_line(name, 200)}`" for name in names[:limit]]
+    shown = [_code(name, 200) for name in names[:limit]]
     more = len(names) - limit
     return ", ".join(shown) + (f" and {more} more" if more > 0 else "")
 
@@ -212,7 +224,7 @@ def result_comment(*, head_sha, result, blockers, review, skipped):
                      "The next review of the latest commit will.")
     elif blockers:
         lines.append("What stands in the way of approval:")
-        lines += [f"- {_one_line(blocker, 300)}" for blocker in blockers]
+        lines += [f"- {_text(blocker, 300)}" for blocker in blockers]
     else:
         lines.append("The review found nothing that blocks approval.")
     # A readable review can still have any shape: nothing here may fail on it.
@@ -224,11 +236,11 @@ def result_comment(*, head_sha, result, blockers, review, skipped):
         for issue in issues[:10]:
             if not isinstance(issue, dict):
                 continue
-            where = _one_line(issue.get("relevant_file"), 200)
+            where = str(issue.get("relevant_file") or "")
             if issue.get("start_line"):
                 where += f":{issue.get('start_line')}"
-            lines.append(f"- `{where}` **{_one_line(issue.get('issue_header'), 80)}**: "
-                         f"{_one_line(issue.get('issue_content'), 300)}")
+            lines.append(f"- {_code(where, 200)} **{_text(issue.get('issue_header'), 80)}**: "
+                         f"{_text(issue.get('issue_content'), 300)}")
     coverage = output.get("coverage") if isinstance(output.get("coverage"), dict) else {}
     unreviewed = [name for key in ("files_not_reviewed", "files_partially_reviewed")
                   if isinstance(coverage.get(key), list)

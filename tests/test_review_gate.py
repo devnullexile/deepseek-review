@@ -366,9 +366,11 @@ class ReviewTriggerTests(unittest.TestCase):
 
     def test_label_mode_reviews_new_commits_only_on_request(self):
         self.assertEqual(self.wanted("synchronize", "label"), (False, True, False))
-        for action in ("opened", "reopened", "ready_for_review", "edited"):
+        for action in ("opened", "reopened", "ready_for_review"):
             with self.subTest(action=action):
                 self.assertEqual(self.wanted(action, "label"), (True, False, False))
+        retarget = {"action": "edited", "changes": {"base": {"ref": {"from": "main"}}}}
+        self.assertTrue(review_gate.review_wanted(retarget, trigger="label", label="review")[0])
 
     def test_the_review_label_asks_for_a_review_in_either_mode(self):
         for trigger in ("push", "label"):
@@ -449,6 +451,31 @@ class MalformedReviewCommentTests(unittest.TestCase):
                 body = review_gate.result_comment(head_sha=HEAD, result="not-approved", review=review,
                                                   skipped=[], blockers=["review output is missing or malformed"])
                 self.assertIn("Not approved", body)
+
+
+class ResultCommentEscapingTests(unittest.TestCase):
+    def test_untrusted_text_renders_as_text_not_markdown(self):
+        review = clean_review(key_issues_to_review=[{
+            "relevant_file": "a`b.py", "issue_header": "**Bold**",
+            "issue_content": "[approve here](https://evil.example) _x_ <b>"}])
+        body = review_gate.result_comment(head_sha=HEAD, result="not-approved", review=review,
+                                          skipped=["x` [click](https://evil.example)`.csv"],
+                                          blockers=["1 key issue(s) reported"])
+        # The finding's link is escaped; the file name stays inside one code span.
+        self.assertNotIn("[approve here](", body)
+        self.assertIn("`xʼ [click](https://evil.example)ʼ.csv`", body)
+        self.assertNotIn("x` [click]", body)
+        self.assertIn("\\[approve here\\]", body)
+
+
+class EditedEventTests(unittest.TestCase):
+    def test_only_a_retarget_counts_as_an_edit_in_either_mode(self):
+        for trigger in ("push", "label"):
+            with self.subTest(trigger=trigger):
+                retarget = {"action": "edited", "changes": {"base": {"ref": {"from": "main"}}}}
+                title = {"action": "edited", "changes": {"title": {"from": "old"}}}
+                self.assertTrue(review_gate.review_wanted(retarget, trigger=trigger, label="review")[0])
+                self.assertFalse(review_gate.review_wanted(title, trigger=trigger, label="review")[0])
 
 if __name__ == "__main__":
     unittest.main()
