@@ -47,16 +47,17 @@ name: DeepSeek PR Review
 
 on:
   pull_request_target:
-    types: [opened, reopened, ready_for_review, synchronize]
+    types: [opened, reopened, ready_for_review, synchronize, edited]
 
 permissions: {}
 
 concurrency:
-  group: deepseek-review-${{ github.event.pull_request.number }}
+  group: deepseek-review-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && !github.event.changes.base && '-edit' || '' }}
   cancel-in-progress: true
 
 jobs:
   review:
+    if: github.event.action != 'edited' || github.event.changes.base
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -71,6 +72,8 @@ jobs:
           # extra-instructions: |
           #   Check that every user-facing string exists in both locales.
 ```
+
+Триггер `edited`, условие задания и группа конкурентности `-edit` запускают ревью заново, когда у PR меняется базовая ветка, например когда PR из стека переводят на другую ветку: diff меняется без нового коммита, и без этого прежнее одобрение осталось бы в силе. Правка заголовка или описания не запускает ревью и не отменяет уже идущее.
 
 `pull_request_target` запускает workflow из базовой ветки и даёт ему доступ к секретам, даже для PR из форков. Здесь это безопасно только потому, что код из PR не выполняется. Не добавляйте шаг, который скачивает и запускает код из PR.
 

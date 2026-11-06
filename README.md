@@ -47,16 +47,17 @@ name: DeepSeek PR Review
 
 on:
   pull_request_target:
-    types: [opened, reopened, ready_for_review, synchronize]
+    types: [opened, reopened, ready_for_review, synchronize, edited]
 
 permissions: {}
 
 concurrency:
-  group: deepseek-review-${{ github.event.pull_request.number }}
+  group: deepseek-review-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && !github.event.changes.base && '-edit' || '' }}
   cancel-in-progress: true
 
 jobs:
   review:
+    if: github.event.action != 'edited' || github.event.changes.base
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -71,6 +72,8 @@ jobs:
           # extra-instructions: |
           #   Check that every user-facing string exists in both locales.
 ```
+
+The `edited` trigger, the job condition and the `-edit` concurrency group review a pull request again when its base branch changes, for example when a stacked pull request is retargeted: the diff changes without a new commit, so an earlier approval would otherwise stay. A title or body edit starts no review and never cancels a running one.
 
 `pull_request_target` runs the workflow file from the base branch with access to secrets, including for pull requests from forks. That is safe here only because no pull request code is executed. Do not add a step that checks out and runs the pull request head.
 
