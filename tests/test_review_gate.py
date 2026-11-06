@@ -439,5 +439,16 @@ class PostResultTests(unittest.TestCase):
         review_gate.post_result(client, BOT, review_gate.RESULT_MARKER + " new")
         self.assertEqual(client.created, [review_gate.RESULT_MARKER + " new"])
 
+
+class MalformedReviewCommentTests(unittest.TestCase):
+    def test_a_readable_but_malformed_review_still_gets_a_result_comment(self):
+        for review in ({"review": []}, {"review": {"key_issues_to_review": "x"}, "coverage": []},
+                       {"review": {"key_issues_to_review": [None, "x"]}, "coverage": {"files_not_reviewed": "a"}},
+                       [], "text"):
+            with self.subTest(review=review):
+                body = review_gate.result_comment(head_sha=HEAD, result="not-approved", review=review,
+                                                  skipped=[], blockers=["review output is missing or malformed"])
+                self.assertIn("Not approved", body)
+
 if __name__ == "__main__":
     unittest.main()

@@ -215,7 +215,10 @@ def result_comment(*, head_sha, result, blockers, review, skipped):
         lines += [f"- {_one_line(blocker, 300)}" for blocker in blockers]
     else:
         lines.append("The review found nothing that blocks approval.")
-    issues = ((review or {}).get("review") or {}).get("key_issues_to_review")
+    # A readable review can still have any shape: nothing here may fail on it.
+    output = review if isinstance(review, dict) else {}
+    body = output.get("review") if isinstance(output.get("review"), dict) else {}
+    issues = body.get("key_issues_to_review")
     if isinstance(issues, list) and issues:
         lines += ["", "Findings of this review:"]
         for issue in issues[:10]:
@@ -226,9 +229,10 @@ def result_comment(*, head_sha, result, blockers, review, skipped):
                 where += f":{issue.get('start_line')}"
             lines.append(f"- `{where}` **{_one_line(issue.get('issue_header'), 80)}**: "
                          f"{_one_line(issue.get('issue_content'), 300)}")
-    coverage = (review or {}).get("coverage") or {}
+    coverage = output.get("coverage") if isinstance(output.get("coverage"), dict) else {}
     unreviewed = [name for key in ("files_not_reviewed", "files_partially_reviewed")
-                  for name in (coverage.get(key) or []) if isinstance(name, str)]
+                  if isinstance(coverage.get(key), list)
+                  for name in coverage[key] if isinstance(name, str)]
     if unreviewed:
         lines += ["", f"The model could not review in full: {_listed(unreviewed)}."]
     if skipped:
@@ -510,12 +514,9 @@ def command_gate():
     if not isinstance(pull_request, dict):
         raise SystemExit("This action must run on a pull_request or pull_request_target event.")
     wanted, stale, requested, why = review_wanted(event, trigger=trigger, label=label)
-    if not wanted:
+    if not wanted and not stale:
         print(f"Skipping review: {why}")
-        if stale:
-            _set_outputs(run="false", stale="true", **{"pr-number": pull_request["number"]})
-        else:
-            _set_outputs(run="false")
+        _set_outputs(run="false")
         return
     allowed_authors = _split_list(os.environ.get("ALLOWED_AUTHORS", ""))
     is_member = None
@@ -534,7 +535,12 @@ def command_gate():
                     "GitHub App the organization permission Members: Read-only and accept it in the "
                     "installation settings.")
             return client.is_org_member(owner["login"], login)
+    # A pull request the bot skips is never touched, also when its approval would be stale.
     allowed, reason = author_allowed(pull_request, allowed_authors, is_member=is_member)
+    if allowed and stale:
+        print(f"Skipping review: {why}")
+        _set_outputs(run="false", stale="true", **{"pr-number": pull_request["number"]})
+        return
     print(f"{'Reviewing' if allowed else 'Skipping review'}: {reason}; {why}")
     if allowed:
         extra = {"label-requested": "true"} if requested else {}

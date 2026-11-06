@@ -437,5 +437,21 @@ class NewCommandTests(ApiCommandTests):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("review-on", result.stdout + result.stderr)
 
+
+class LabelModeGateTests(CliTestCase):
+    def test_a_push_to_a_pull_request_the_bot_skips_never_touches_it(self):
+        event = self.tmp / "event.json"
+        for pr in ({"number": 7, "html_url": "u", "draft": True, "user": {"login": "alice"},
+                    "author_association": "OWNER"},
+                   {"number": 7, "html_url": "u", "draft": False, "user": {"login": "stranger"},
+                    "author_association": "NONE"}):
+            with self.subTest(pr=pr):
+                self.output.write_text("")
+                event.write_text(json.dumps({"action": "synchronize", "pull_request": pr}))
+                result = self.run_cli("gate", GITHUB_EVENT_PATH=str(event), ALLOWED_AUTHORS="",
+                                      REVIEW_ON="label")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.outputs(), {"run": "false"})
+
 if __name__ == "__main__":
     unittest.main()
