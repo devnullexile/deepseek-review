@@ -12,6 +12,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "review_gate.py"
 BOT = "devnullexile-deepseek-review[bot]"
 HEAD = "c" * 40
 OLD = "d" * 40
+TOO_LARGE = object()  # A file the fake serves like GitHub serves one over 1 MB.
 CLEAN = {
     "review": {"merge_recommendation": "no_concerns_found", "key_issues_to_review": [],
                "security_concerns": "No"},
@@ -24,6 +25,7 @@ class FakeGitHub:
 
     def __init__(self, head_sha, reviews, files=(), members=()):
         self.head_sha = head_sha
+        self.base_sha = "e" * 40
         self.reviews = reviews
         self.files = list(files)
         self.members = None if members is None else set(members)
@@ -68,12 +70,15 @@ class FakeGitHub:
                     return self._send(200, fake.files)
                 if self.path == "/repos/o/r/pulls/7":
                     return self._send(200, {"head": {"sha": fake.head_sha},
+                                            "base": {"sha": fake.base_sha},
                                             "changed_files": len(fake.files)})
                 if self.path.startswith("/repos/o/r/contents/"):
                     path, _, ref = self.path[len("/repos/o/r/contents/"):].partition("?ref=")
                     text = fake.contents.get((path, ref))
                     if text is None:
                         return self._send(404, {"message": "Not Found"})
+                    if text is TOO_LARGE:  # GitHub serves a file over 1 MB without its content.
+                        return self._send(200, {"encoding": "none", "content": "", "size": 1_100_000})
                     import base64
                     return self._send(200, {"encoding": "base64",
                                             "content": base64.b64encode(text.encode()).decode()})
@@ -102,9 +107,10 @@ class FakeGitHub:
                     nodes = [{"id": t.get("id"), "isResolved": t["isResolved"], "path": t.get("path"),
                               "line": t.get("line"), "originalLine": t.get("originalLine"),
                               "originalStartLine": t.get("originalStartLine"),
+                              "resolvedBy": {"login": t["resolvedBy"]} if t.get("resolvedBy") else None,
                               "comments": {"nodes": [
                         {"author": {"login": t["author"]}, "createdAt": t["createdAt"],
-                         "originalCommit": {"oid": t.get("commit")}}]}}
+                         "body": t.get("body", ""), "originalCommit": {"oid": t.get("commit")}}]}}
                         for t in fake.threads]
                     return self._send(200, {"data": {"repository": {"pullRequest": {"reviewThreads": {
                         "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}}}}})

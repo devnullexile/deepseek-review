@@ -34,6 +34,8 @@ if behavior == "ok":
     json.dump(json.loads(os.environ["FAKE_REVIEW"]), open(target, "w"))
 elif behavior == "badjson":
     open(target, "w").write("{not json")
+with open(os.environ["FAKE_CALLS"] + ".instructions", "w") as handle:
+    handle.write(os.environ.get("PR_REVIEWER__EXTRA_INSTRUCTIONS", ""))
 sys.exit(1 if behavior == "fail" else 0)
 '''
 
@@ -55,14 +57,19 @@ class ReviewStepTests(unittest.TestCase):
         self.bin = bin_dir
         self.calls = self.dir / "calls.txt"
 
-    def run_step(self, plan, attempts="2", previous="60000"):
+    def run_step(self, plan, attempts="2", previous="60000", earlier="", left_out=None):
+        if left_out is not None:
+            (self.dir / "deepseek-review").mkdir(exist_ok=True)
+            (self.dir / "deepseek-review" / "left-out.txt").write_text(left_out)
         env = {
             "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
             "RUNNER_TEMP": str(self.dir),
             "PR_URL": "https://github.com/o/r/pull/1",
             "PR_AGENT_IMAGE": "pragent/pr-agent:test",
             "BASE_INSTRUCTIONS": "Base.\n",
-            "EXTRA_INSTRUCTIONS": "",
+            "EXTRA_INSTRUCTIONS": "Project.\n",
+            "LATER_INSTRUCTIONS": self.step["env"]["LATER_INSTRUCTIONS"],
+            "EARLIER_REVIEWS": earlier,
             "IGNORE_GLOBS": "",
             "REVIEW_ATTEMPTS": attempts,
             "RETRY_DELAY_SECONDS": "0",
@@ -142,6 +149,29 @@ class ReviewStepTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(self.call_count, 0)
         self.assertEqual(self.run_step(["ok"], previous="0").returncode, 0)
+
+    def instructions(self):
+        return Path(str(self.calls) + ".instructions").read_text()
+
+    def test_the_first_review_gets_the_base_and_project_instructions_only(self):
+        self.assertEqual(self.run_step(["ok"]).returncode, 0)
+        self.assertEqual(self.instructions(), "Base.\nProject.\n")
+
+    def test_a_later_review_is_told_to_raise_only_new_confirmed_defects(self):
+        self.assertEqual(self.run_step(["ok"], earlier="3").returncode, 0)
+        text = self.instructions()
+        self.assertTrue(text.startswith("Base.\nThis pull request had 3 earlier review(s). Its author"))
+        self.assertTrue(text.endswith("already covered.\nProject.\n"))
+
+    def test_the_model_is_told_which_files_it_does_not_see(self):
+        self.assertEqual(self.run_step(["ok"], left_out="These changed files are left out.\n").returncode, 0)
+        self.assertEqual(self.instructions(), "Base.\nThese changed files are left out.\nProject.\n")
+
+    def test_an_unreadable_review_count_adds_nothing(self):
+        for earlier in ("", "0", "x"):
+            with self.subTest(earlier=earlier):
+                self.assertEqual(self.run_step(["ok"], earlier=earlier).returncode, 0)
+                self.assertEqual(self.instructions(), "Base.\nProject.\n")
 
     def test_defaults_retry_once(self):
         self.assertEqual(self.inputs["review-attempts"]["default"], "2")
