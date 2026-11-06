@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -313,6 +314,130 @@ class SyncApprovalTests(unittest.TestCase):
         self.assertEqual(self.sync(client, clean_review()), "approved")
         self.assertEqual(client.dismissed, [])
 
+
+
+class DataFileTests(unittest.TestCase):
+    def changed(self, name, additions=10, patch=True):
+        item = {"filename": name, "additions": additions, "changes": additions}
+        if patch:
+            item["patch"] = "@@"
+        return item
+
+    def test_lock_files_and_data_formats_always_count_wherever_they_are(self):
+        for name in ("uv.lock", "web/package-lock.json", "go.sum", "runs/out.jsonl",
+                     "data/table.csv", "static/app.min.js"):
+            with self.subTest(name=name):
+                self.assertEqual(review_gate.data_files([self.changed(name, 3)], max_lines=1000), [name])
+
+    def test_structured_files_count_only_when_large_or_without_a_patch(self):
+        files = [self.changed("package.json", 40), self.changed("evidence/runs.json", 5000),
+                 self.changed("config.yaml", 20, patch=False), self.changed("src/app.py", 9000)]
+        self.assertEqual(review_gate.data_files(files, max_lines=1000),
+                         ["evidence/runs.json", "config.yaml"])
+
+    def test_a_path_a_person_approves_is_always_reviewed(self):
+        files = [self.changed(".github/workflows/big.yml", 5000), self.changed("uv.lock")]
+        self.assertEqual(review_gate.data_files(files, max_lines=1000, protected=[".github/*"]),
+                         ["uv.lock"])
+
+    def test_each_skipped_file_becomes_an_exact_glob_after_the_users_own(self):
+        globs, kept = review_gate.ignore_list(["*.meta"], ["data/[v2]*.json", "a.lock"])
+        self.assertEqual(globs, ["*.meta", "data/[[]v2][*].json", "a.lock"])
+        self.assertEqual(kept, ["data/[v2]*.json", "a.lock"])
+
+    def test_the_ignore_list_stays_inside_the_environment_limit(self):
+        many = [f"data/{n:05}-{'x' * 80}.jsonl" for n in range(3000)]
+        globs, kept = review_gate.ignore_list([], many)
+        self.assertLess(len(json.dumps(globs)), review_gate.MAX_IGNORE_CHARS + 200)
+        self.assertLess(len(kept), len(many))
+        self.assertEqual(globs, kept)
+
+
+class ReviewTriggerTests(unittest.TestCase):
+    def wanted(self, action, trigger="push", label_name=None):
+        event = {"action": action}
+        if label_name is not None:
+            event["label"] = {"name": label_name}
+        return review_gate.review_wanted(event, trigger=trigger, label="review")[:3]
+
+    def test_push_mode_reviews_every_commit(self):
+        self.assertEqual(self.wanted("synchronize"), (True, False, False))
+        self.assertEqual(self.wanted("opened"), (True, False, False))
+
+    def test_label_mode_reviews_new_commits_only_on_request(self):
+        self.assertEqual(self.wanted("synchronize", "label"), (False, True, False))
+        for action in ("opened", "reopened", "ready_for_review", "edited"):
+            with self.subTest(action=action):
+                self.assertEqual(self.wanted(action, "label"), (True, False, False))
+
+    def test_the_review_label_asks_for_a_review_in_either_mode(self):
+        for trigger in ("push", "label"):
+            with self.subTest(trigger=trigger):
+                self.assertEqual(self.wanted("labeled", trigger, "Review"), (True, False, True))
+                self.assertEqual(self.wanted("labeled", trigger, "bug"), (False, False, False))
+
+
+class ResultCommentTests(unittest.TestCase):
+    def test_it_names_every_reason_finding_and_left_out_file(self):
+        review = clean_review(merge_recommendation="changes_required", key_issues_to_review=[
+            {"relevant_file": "src/a.py", "start_line": 12, "issue_header": "Possible Bug",
+             "issue_content": "x is None when the list is empty"}])
+        review["coverage"]["files_not_reviewed"] = ["docs/big.md"]
+        body = review_gate.result_comment(
+            head_sha=HEAD, result="not-approved", review=review, skipped=["uv.lock"],
+            blockers=["merge recommendation is 'changes_required'", "1 key issue(s) reported"])
+        self.assertTrue(body.startswith(review_gate.RESULT_MARKER))
+        for text in ("Not approved", "aaaaaaa", "changes_required", "`src/a.py:12`", "Possible Bug",
+                     "x is None when the list is empty", "`docs/big.md`", "`uv.lock`"):
+            self.assertIn(text, body)
+
+    def test_a_clean_review_says_nothing_blocks_approval(self):
+        body = review_gate.result_comment(head_sha=HEAD, result="approved", review=clean_review(),
+                                          skipped=[], blockers=[])
+        self.assertIn("Approved", body)
+        self.assertIn("nothing that blocks approval", body)
+
+    def test_model_text_cannot_mention_people_or_end_the_marker(self):
+        review = clean_review(key_issues_to_review=[{"relevant_file": "a", "issue_header": "h",
+                                                     "issue_content": "ask @alice --> <!-- x"}])
+        body = review_gate.result_comment(head_sha=HEAD, result="not-approved", review=review,
+                                          skipped=[], blockers=["1 key issue(s) reported"])
+        self.assertNotIn("@alice", body)
+        self.assertEqual(body.count("<!--"), 1)
+
+    def test_a_review_overtaken_by_new_commits_decides_nothing(self):
+        body = review_gate.result_comment(head_sha=HEAD, result="head-changed", review=None,
+                                          skipped=[], blockers=[])
+        self.assertIn("Not decided", body)
+
+
+class PostResultTests(unittest.TestCase):
+    class Comments:
+        def __init__(self, comments):
+            self.comments = comments
+            self.created, self.updated = [], []
+
+        def list_comments(self):
+            return self.comments
+
+        def create_comment(self, body):
+            self.created.append(body)
+
+        def update_comment(self, comment_id, body):
+            self.updated.append((comment_id, body))
+
+    def test_the_bots_own_comment_is_updated_not_repeated(self):
+        client = self.Comments([
+            {"id": 1, "user": {"login": "alice"}, "body": review_gate.RESULT_MARKER + " copied"},
+            {"id": 2, "user": {"login": BOT}, "body": review_gate.RESULT_MARKER + " old"}])
+        review_gate.post_result(client, BOT, review_gate.RESULT_MARKER + " new")
+        self.assertEqual(client.updated, [(2, review_gate.RESULT_MARKER + " new")])
+        self.assertEqual(client.created, [])
+
+    def test_the_first_result_is_posted(self):
+        client = self.Comments([])
+        review_gate.post_result(client, BOT, review_gate.RESULT_MARKER + " new")
+        self.assertEqual(client.created, [review_gate.RESULT_MARKER + " new"])
 
 if __name__ == "__main__":
     unittest.main()

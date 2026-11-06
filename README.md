@@ -8,16 +8,18 @@ A GitHub Action that reviews pull requests with [pr-agent](https://github.com/qo
 
 1. Skips draft pull requests and authors you do not trust (see [Who gets reviewed](#who-gets-reviewed)).
 2. Creates a short-lived token for the reviewer GitHub App. The token is limited to the current repository.
-3. Runs pr-agent in a container. It reads the diff through the GitHub API and posts a summary comment and inline findings. Pull request code is never checked out or executed. If an attempt fails or writes no readable review, for example after the DeepSeek API drops a connection, the review runs again, up to `review-attempts` times. If every attempt fails, the step fails.
+3. Runs pr-agent in a container. It reads the diff through the GitHub API and posts a summary comment and inline findings. Pull request code is never checked out or executed. Data files are left out of the review (see [Data files](#data-files)), and the model sees its earlier findings and the replies in their resolved threads, so it does not raise them again in other words. If an attempt fails or writes no readable review, for example after the DeepSeek API drops a connection, the review runs again, up to `review-attempts` times. If every attempt fails, the step fails.
 4. Approves the pull request when all of these hold:
    - the merge recommendation is `no_concerns_found`;
    - no key issues and no security concerns were reported;
-   - every changed file was fully reviewed;
+   - every changed file that was not left out as data was fully reviewed;
    - no changed file matches `approval-excluded-paths` (by default `.github/*`, so a person approves CI changes);
    - the head commit did not change while the review ran.
 
    The approval is pinned to the reviewed commit. In any other case, the bot withdraws (dismisses) its own earlier approvals. A failed review also withdraws them. Reviews by people are never touched.
 5. Optionally (`request-changes: "true"`), requests changes when the model's verdict is `changes_required`. A later approval by the bot supersedes the request. A later completed review with a softer verdict withdraws it. A failed review keeps it, so a merge that the request blocks stays blocked.
+
+6. Keeps one result comment up to date: what the bot decided on the latest commit and every reason, with the findings, the files the model could not review, and the data files a person should check. It is updated on each review, not repeated.
 
 The approval is a signal, not a guarantee. A language model can miss defects, and the text of a pull request can try to manipulate it. Keep human review for anything that matters.
 
@@ -77,6 +79,22 @@ The `edited` trigger, the job condition and the `-edit` concurrency group review
 
 `pull_request_target` runs the workflow file from the base branch with access to secrets, including for pull requests from forks. That is safe here only because no pull request code is executed. Do not add a step that checks out and runs the pull request head.
 
+## Data files
+
+Lock files, JSON Lines, CSV and minified files, and JSON, YAML, XML or TOML files with more than `data-file-lines` (1000) added lines, are left out of the model review. They stay in the pull request: nothing is moved or removed. A model cannot review such files usefully, and a large one fills the token window, so the code would be left unreviewed. The result comment lists them for a person to check, and they do not block approval, like `ignore-globs`. A path in `approval-excluded-paths` is always reviewed. Turn this off with `skip-data-files: "false"`.
+
+## Review on request
+
+By default every new commit is reviewed (`review-on: push`). For a big pull request that goes through many rounds of fixes, set `review-on: label`. The pull request is then reviewed when it is opened, reopened, marked ready for review or retargeted, and after that only when someone adds the `review` label: on the pull request page, click **Labels** in the right column and choose `review`, or run `gh pr edit <number> --add-label review`. The bot removes the label when the review starts, so adding it again asks for another review of the latest commit. A new commit without the label withdraws the bot's approval of older commits, and the result comment says so. Create the label once under **Issues → Labels → New label**, and add `labeled` to the workflow's event types:
+
+```yaml
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize, edited, labeled]
+```
+
+With `labeled` in the list, the `review` label also asks for a review in the default `push` mode.
+
 ## Runner requirements
 
 The action needs a Linux runner with Docker and Python 3. GitHub-hosted `ubuntu-latest` runners have both.
@@ -102,6 +120,12 @@ To review only members of the organization that owns the repository, set `member
 | `approval-excluded-paths` | `.github/*` | Globs the bot never approves; a person must. `*` also matches `/`. Empty allows any path |
 | `extra-instructions` | empty | Project rules appended to the default review policy |
 | `ignore-globs` | empty | JSON array of globs to skip, e.g. `'["*.meta", "*.unity"]'`; skipped files are not reviewed and do not block approval |
+| `skip-data-files` | `true` | Leave [data files](#data-files) out of the review; they are listed in the result comment |
+| `data-file-lines` | `1000` | Added lines above which a JSON, YAML, XML or TOML file counts as data |
+| `max-previous-findings-chars` | `60000` | Room for earlier findings and the replies in their resolved threads, so they are not raised again; pr-agent's own default is 8000, and `0` turns it off |
+| `result-comment` | `true` | Keep one comment with what the bot decided and why |
+| `review-on` | `push` | `push` reviews every commit; `label` reviews new commits only when the review label is added (see [Review on request](#review-on-request)) |
+| `review-label` | `review` | Label that asks for a review of the latest commit; the bot removes it when the review starts |
 | `model` | `deepseek/deepseek-flash` | LiteLLM model name; this is DeepSeek-V4.1-Flash |
 | `max-model-tokens` | `512000` | Token window per call; the prompt gets what remains after `max-output-tokens` (128K by default) |
 | `max-output-tokens` | `384000` | Output token limit per call, including the model's thinking; lower it, together with `max-model-tokens`, for models with a smaller limit |

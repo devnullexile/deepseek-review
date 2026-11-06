@@ -3,15 +3,32 @@
 import fnmatch
 import json
 import os
+import posixpath
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 WRITER_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 NEGATIVE_SECURITY_ANSWERS = frozenset({"no", "none", "false"})
 # Used when APPROVAL_EXCLUDED_PATHS is unset; only an explicitly empty value approves any path.
 DEFAULT_EXCLUDED_PATHS = ".github/*"
+
+# Files that hold data, not code: a model cannot review them usefully, and a large one fills the
+# token window so the code is left unreviewed. Matched against the file name, not its folder.
+DATA_FILE_NAMES = (
+    "*.jsonl", "*.ndjson", "*.csv", "*.tsv", "*.min.js", "*.min.css", "*.map",
+    "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock",
+    "poetry.lock", "uv.lock", "Pipfile.lock", "pdm.lock", "Cargo.lock", "go.sum",
+    "composer.lock", "Gemfile.lock", "packages.lock.json", "flake.lock",
+)
+# Structured data that is code-like when small (package.json, a workflow) and data when large.
+STRUCTURED_DATA_SUFFIXES = (".json", ".yaml", ".yml", ".xml", ".toml")
+# GitHub limits one environment value to about 128 KB; the ignore list stays well inside it.
+MAX_IGNORE_CHARS = 100_000
+RESULT_MARKER = "<!-- deepseek-review:result -->"
+REVIEW_TRIGGERS = ("push", "label")
 
 
 def author_allowed(pull_request, allowed_authors, is_member=None):
@@ -102,6 +119,142 @@ def path_blockers(files, patterns):
     return [f"changes to {shown} need a human approval"]
 
 
+def data_files(files, *, max_lines, protected=()):
+    """Changed files to leave out of the model review as data, in the order GitHub lists them.
+
+    A lock file, JSON Lines, CSV or minified file always counts. A JSON, YAML, XML or TOML file
+    counts when more than max_lines lines were added, or when GitHub sends no patch for it
+    because it is too large. A path a person must approve (protected) is always reviewed.
+    """
+    found = []
+    for changed in files:
+        name = changed.get("filename") or ""
+        if not name or any(fnmatch.fnmatchcase(name, pattern) for pattern in protected):
+            continue
+        base = posixpath.basename(name)
+        if any(fnmatch.fnmatchcase(base, pattern) for pattern in DATA_FILE_NAMES):
+            found.append(name)
+        elif base.lower().endswith(STRUCTURED_DATA_SUFFIXES) and (
+            (changed.get("additions") or 0) > max_lines
+            or ("patch" not in changed and (changed.get("changes") or 0) > 0)
+        ):
+            found.append(name)
+    return found
+
+
+def escape_glob(path):
+    """A glob that matches exactly this path."""
+    return re.sub(r"([*?\[])", r"[\1]", path)
+
+
+def ignore_list(user_globs, skipped):
+    """The globs pr-agent leaves out: the user's own, then each skipped data file, within the
+    environment size limit. Returns (globs, the skipped files that fit)."""
+    globs = list(user_globs)
+    kept = []
+    size = len(json.dumps(globs))
+    for path in skipped:
+        glob = escape_glob(path)
+        size += len(json.dumps(glob)) + 2
+        if size > MAX_IGNORE_CHARS:
+            break
+        globs.append(glob)
+        kept.append(path)
+    return globs, kept
+
+
+def review_wanted(event, *, trigger, label):
+    """(run, stale, label_requested, reason) for this pull request event.
+
+    With trigger "push" every new commit is reviewed. With "label" a pull request is reviewed
+    when it is opened, reopened, marked ready or retargeted, and later only when someone adds
+    the review label; a push then only withdraws an approval of older commits (stale).
+    In both modes, adding the review label asks for a review of the current commit.
+    """
+    action = event.get("action")
+    if action == "labeled":
+        name = ((event.get("label") or {}).get("name") or "").strip().lower()
+        if name == label.strip().lower():
+            return True, False, True, f"the {label!r} label asks for a review"
+        return False, False, False, f"the {name!r} label does not ask for a review"
+    if trigger == "label" and action == "synchronize":
+        return False, True, False, f"new commits are reviewed when someone adds the {label!r} label"
+    return True, False, False, f"the pull request was {action or 'updated'}"
+
+
+def _one_line(text, limit):
+    text = " ".join(str(text or "").split())
+    # A comment must not end our marker or mention a person.
+    text = text.replace("<!--", "< !--").replace("@", "@\u200b")
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _listed(names, limit=10):
+    shown = [f"`{_one_line(name, 200)}`" for name in names[:limit]]
+    more = len(names) - limit
+    return ", ".join(shown) + (f" and {more} more" if more > 0 else "")
+
+
+RESULT_TITLES = {
+    "approved": "Approved", "already-approved": "Approved",
+    "changes-requested": "Changes requested", "already-changes-requested": "Changes requested",
+    "no-concerns": "No blocking concerns", "not-approved": "Not approved",
+    "head-changed": "Not decided", "": "Reviewed",
+}
+
+
+def result_comment(*, head_sha, result, blockers, review, skipped):
+    """The bot's own result comment: what it decided, and every reason, in one place."""
+    title = RESULT_TITLES.get(result, "Not approved")
+    lines = [RESULT_MARKER, f"### DeepSeek review: {title} (`{head_sha[:7]}`)", ""]
+    if result == "head-changed":
+        lines.append("New commits arrived during this review, so it decides nothing. "
+                     "The next review of the latest commit will.")
+    elif blockers:
+        lines.append("What stands in the way of approval:")
+        lines += [f"- {_one_line(blocker, 300)}" for blocker in blockers]
+    else:
+        lines.append("The review found nothing that blocks approval.")
+    issues = ((review or {}).get("review") or {}).get("key_issues_to_review")
+    if isinstance(issues, list) and issues:
+        lines += ["", "Findings of this review:"]
+        for issue in issues[:10]:
+            if not isinstance(issue, dict):
+                continue
+            where = _one_line(issue.get("relevant_file"), 200)
+            if issue.get("start_line"):
+                where += f":{issue.get('start_line')}"
+            lines.append(f"- `{where}` **{_one_line(issue.get('issue_header'), 80)}**: "
+                         f"{_one_line(issue.get('issue_content'), 300)}")
+    coverage = (review or {}).get("coverage") or {}
+    unreviewed = [name for key in ("files_not_reviewed", "files_partially_reviewed")
+                  for name in (coverage.get(key) or []) if isinstance(name, str)]
+    if unreviewed:
+        lines += ["", f"The model could not review in full: {_listed(unreviewed)}."]
+    if skipped:
+        lines += ["", f"Left out of the review as data files, for a person to check: {_listed(skipped)}."]
+    lines += ["", "_This comment is updated on every review. The review comment has the details._"]
+    return "\n".join(lines)
+
+
+def stale_comment(label):
+    return "\n".join([
+        RESULT_MARKER, "### DeepSeek review: Not reviewed yet", "",
+        f"New commits arrived after the last review. Add the `{label}` label to review them.",
+        "", "_This comment is updated on every review._"])
+
+
+def post_result(client, bot_login, body):
+    """Update the bot's result comment, or post the first one."""
+    for comment in client.list_comments():
+        if ((comment.get("user") or {}).get("login") == bot_login
+                and (comment.get("body") or "").startswith(RESULT_MARKER)):
+            if comment.get("body") != body:
+                client.update_comment(comment["id"], body)
+            return
+    client.create_comment(body)
+
+
 def _recommendation(output):
     """The merge recommendation of a parsed review, or None when the review is unusable."""
     if not isinstance(output, dict) or not isinstance(output.get("review"), dict):
@@ -109,9 +262,23 @@ def _recommendation(output):
     return output["review"].get("merge_recommendation")
 
 
+def decision_blockers(client, review, excluded_patterns=()):
+    """Every reason that prevents approval of this review, including paths a person approves."""
+    blockers = approval_blockers(review)
+    if not blockers and excluded_patterns:
+        files = client.list_files()
+        expected = client.changed_file_count()
+        if len(files) < expected:
+            # GitHub lists at most 3000 files; an unlisted file could match a protected path.
+            blockers = [f"only {len(files)} of {expected} changed files could be listed"]
+        else:
+            blockers = path_blockers(files, excluded_patterns)
+    return blockers
+
+
 def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
                   excluded_patterns=(), approve=True, request_changes=False,
-                  report=lambda blocker: None):
+                  report=lambda blocker: None, note=""):
     """Bring the bot's own review state in line with the latest review of an unchanged head.
 
     Approves a clean review (when approve is set), requests changes when the model says
@@ -133,15 +300,7 @@ def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
         return (latest is not None and latest.get("state") == state
                 and latest.get("commit_id") == head_sha_after)
 
-    blockers = approval_blockers(review)
-    if not blockers and excluded_patterns:
-        files = client.list_files()
-        expected = client.changed_file_count()
-        if len(files) < expected:
-            # GitHub lists at most 3000 files; an unlisted file could match a protected path.
-            blockers = [f"only {len(files)} of {expected} changed files could be listed"]
-        else:
-            blockers = path_blockers(files, excluded_patterns)
+    blockers = decision_blockers(client, review, excluded_patterns)
     for blocker in blockers:
         report(blocker)
     short_sha = head_sha_after[:7]
@@ -156,7 +315,8 @@ def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
             return "no-concerns"
         if is_current("APPROVED"):
             return "already-approved"
-        client.approve(head_sha_after, f"Automated DeepSeek review found no blocking concerns in {short_sha}.")
+        client.approve(head_sha_after,
+                       f"Automated DeepSeek review found no blocking concerns in {short_sha}.{note}")
         # Withdraw explicitly rather than rely on the approval superseding the request.
         withdraw(change_requests, f"Automated DeepSeek review found no blocking concerns in {short_sha}.")
         return "approved"
@@ -196,6 +356,8 @@ class GitHubClient:
         self.api_url = api_url.rstrip("/")
         self.token = token
         self.pull_path = f"/repos/{repository}/pulls/{number}"
+        self.issue_path = f"/repos/{repository}/issues/{number}"
+        self.comments_path = f"/repos/{repository}/issues/comments"
 
     def _request(self, method, url, payload=None):
         if url.startswith("/"):
@@ -264,6 +426,22 @@ class GitHubClient:
         self._request("POST", f"{self.pull_path}/reviews",
                       {"commit_id": commit_sha, "event": "REQUEST_CHANGES", "body": body})
 
+    def list_comments(self):
+        return self._paginate(f"{self.issue_path}/comments?per_page=100")
+
+    def create_comment(self, body):
+        self._request("POST", f"{self.issue_path}/comments", {"body": body})
+
+    def update_comment(self, comment_id, body):
+        self._request("PATCH", f"{self.comments_path}/{comment_id}", {"body": body})
+
+    def remove_label(self, name):
+        try:
+            self._request("DELETE", f"{self.issue_path}/labels/{urllib.parse.quote(name, safe='')}")
+        except GitHubError as error:
+            if error.status != 404:  # Already removed, for example by a person.
+                raise
+
     def dismiss(self, review_id, message):
         self._request("PUT", f"{self.pull_path}/reviews/{review_id}/dismissals",
                       {"message": message, "event": "DISMISS"})
@@ -305,13 +483,40 @@ def _validate_ignore_globs(text):
         raise SystemExit("ignore-globs must be a JSON array of strings, for example '[\"*.meta\"]'.")
 
 
+def _positive_int(name, text):
+    if not re.fullmatch(r"[0-9]+", text or "") or int(text) <= 0:
+        raise SystemExit(f"{name} must be a positive whole number, not {text!r}.")
+    return int(text)
+
+
+def _true(name, default):
+    value = os.environ.get(name, default)
+    if value not in ("true", "false"):
+        raise SystemExit(f"{name.lower().replace('_', '-')} must be \"true\" or \"false\", not {value!r}.")
+    return value == "true"
+
+
 def command_gate():
     _validate_ignore_globs(os.environ.get("IGNORE_GLOBS", ""))
+    trigger = os.environ.get("REVIEW_ON", "push")
+    if trigger not in REVIEW_TRIGGERS:
+        raise SystemExit(f"review-on must be one of {', '.join(REVIEW_TRIGGERS)}, not {trigger!r}.")
+    label = os.environ.get("REVIEW_LABEL", "review").strip()
+    if not label:
+        raise SystemExit("review-label must not be empty.")
     with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as handle:
         event = json.load(handle)
     pull_request = event.get("pull_request")
     if not isinstance(pull_request, dict):
         raise SystemExit("This action must run on a pull_request or pull_request_target event.")
+    wanted, stale, requested, why = review_wanted(event, trigger=trigger, label=label)
+    if not wanted:
+        print(f"Skipping review: {why}")
+        if stale:
+            _set_outputs(run="false", stale="true", **{"pr-number": pull_request["number"]})
+        else:
+            _set_outputs(run="false")
+        return
     allowed_authors = _split_list(os.environ.get("ALLOWED_AUTHORS", ""))
     is_member = None
     if os.environ.get("MEMBERS_ONLY", "false") == "true":
@@ -330,34 +535,107 @@ def command_gate():
                     "installation settings.")
             return client.is_org_member(owner["login"], login)
     allowed, reason = author_allowed(pull_request, allowed_authors, is_member=is_member)
-    print(f"{'Reviewing' if allowed else 'Skipping review'}: {reason}")
+    print(f"{'Reviewing' if allowed else 'Skipping review'}: {reason}; {why}")
     if allowed:
+        extra = {"label-requested": "true"} if requested else {}
         _set_outputs(run="true", **{"pr-number": pull_request["number"],
-                                    "pr-url": pull_request["html_url"]})
+                                    "pr-url": pull_request["html_url"]}, **extra)
     else:
         _set_outputs(run="false")
+
+
+def command_take_label():
+    """Remove the review label, so that adding it again asks for another review."""
+    _client_from_env().remove_label(os.environ.get("REVIEW_LABEL", "review").strip())
+
+
+def command_data_files():
+    """The ignore list for pr-agent: the user's globs plus the data files of this pull request."""
+    text = os.environ.get("IGNORE_GLOBS", "")
+    _validate_ignore_globs(text)
+    user_globs = json.loads(text) if text.strip() else []
+    skipped = []
+    if _true("SKIP_DATA_FILES", "true"):
+        max_lines = _positive_int("data-file-lines", os.environ.get("DATA_FILE_LINES", "1000"))
+        protected = _split_list(os.environ.get("APPROVAL_EXCLUDED_PATHS", DEFAULT_EXCLUDED_PATHS))
+        found = data_files(_client_from_env().list_files(), max_lines=max_lines, protected=protected)
+        globs, skipped = ignore_list(user_globs, found)
+        if len(skipped) < len(found):
+            print(f"{len(found) - len(skipped)} more data file(s) are reviewed: the ignore list is full.")
+    else:
+        globs = user_globs
+    for path in skipped:
+        print(f"Leaving out of the review as data: {path}")
+    out = os.path.join(os.environ["RUNNER_TEMP"], "deepseek-review")
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, "data-files.json"), "w", encoding="utf-8") as handle:
+        json.dump(skipped, handle)
+    _set_outputs(**{"ignore-globs": json.dumps(globs) if globs else ""})
+
+
+def command_stale():
+    """After new commits in label mode: withdraw the bot's approval of older commits, and say so."""
+    client = _client_from_env()
+    bot_login = os.environ["BOT_LOGIN"]
+    label = os.environ.get("REVIEW_LABEL", "review").strip()
+    if _true("APPROVE", "true"):
+        for record in client.list_reviews():
+            if ((record.get("user") or {}).get("login") == bot_login
+                    and record.get("state") == "APPROVED"):
+                client.dismiss(record["id"], "New commits are not reviewed yet; "
+                                             f"add the {label!r} label to review them.")
+    if _true("RESULT_COMMENT", "true"):
+        post_result(client, bot_login, stale_comment(label))
 
 
 def command_head_sha():
     _set_outputs(sha=_client_from_env().head_sha())
 
 
+def _skipped_data_files():
+    path = os.path.join(os.environ.get("RUNNER_TEMP", ""), "deepseek-review", "data-files.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    return [name for name in value if isinstance(name, str)] if isinstance(value, list) else []
+
+
 def command_approve():
     client = _client_from_env()
     review = _load_review(os.environ["REVIEW_JSON"])
-    result = sync_approval(client, bot_login=os.environ["BOT_LOGIN"],
-                           head_sha_before=os.environ.get("HEAD_SHA_BEFORE", ""),
-                           head_sha_after=client.head_sha(), review=review,
-                           excluded_patterns=_split_list(
-                               os.environ.get("APPROVAL_EXCLUDED_PATHS", DEFAULT_EXCLUDED_PATHS)),
-                           approve=os.environ.get("APPROVE", "true") == "true",
-                           request_changes=os.environ.get("REQUEST_CHANGES", "false") == "true",
-                           report=lambda blocker: print(f"Not approving: {blocker}"))
+    excluded = _split_list(os.environ.get("APPROVAL_EXCLUDED_PATHS", DEFAULT_EXCLUDED_PATHS))
+    approve = _true("APPROVE", "true")
+    request_changes = _true("REQUEST_CHANGES", "false")
+    skipped = _skipped_data_files()
+    head_sha_before = os.environ.get("HEAD_SHA_BEFORE", "")
+    head_sha_after = client.head_sha()
+    blockers = []
+    note = (f" {len(skipped)} data file(s) were left out of the review for a person to check."
+            if skipped else "")
+    if approve or request_changes:
+        result = sync_approval(client, bot_login=os.environ["BOT_LOGIN"],
+                               head_sha_before=head_sha_before, head_sha_after=head_sha_after,
+                               review=review, excluded_patterns=excluded, approve=approve,
+                               request_changes=request_changes, note=note,
+                               report=lambda blocker: (blockers.append(blocker),
+                                                       print(f"Not approving: {blocker}")))
+    else:
+        result = "" if head_sha_before == head_sha_after else "head-changed"
+        if not result:
+            blockers = decision_blockers(client, review, excluded)
     print(f"Approval result: {result}")
     _set_outputs(result=result)
+    if _true("RESULT_COMMENT", "true"):
+        post_result(client, os.environ["BOT_LOGIN"], result_comment(
+            head_sha=head_sha_after, result=result, blockers=blockers, review=review,
+            skipped=skipped))
 
 
-COMMANDS = {"gate": command_gate, "head-sha": command_head_sha, "approve": command_approve}
+COMMANDS = {"gate": command_gate, "head-sha": command_head_sha, "approve": command_approve,
+            "data-files": command_data_files, "take-label": command_take_label,
+            "stale": command_stale}
 
 
 def main(argv):
