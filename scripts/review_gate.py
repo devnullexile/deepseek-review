@@ -57,6 +57,11 @@ SAME_POINT_SHARE = 0.5
 MAX_LEFT_OUT_NAMED = 40
 # The header of a Git LFS pointer file, whose real content is not in the repository.
 LFS_POINTER = "version https://git-lfs.github.com/spec/v1"
+# The lines of a Git LFS pointer file: its version, the object id and the object size.
+LFS_POINTER_LINE_RE = re.compile(r"(?:version https://git-lfs\.github\.com/spec/v1|oid sha256:[0-9a-f]+"
+                                 r"|size [0-9]+)")
+# The documented marker of an unverified claim: "Question:" at the start of the header.
+QUESTION_RE = re.compile(r"\s*question\s*:", re.IGNORECASE)
 REVIEW_TRIGGERS = ("push", "label")
 # The pull request events that can ask for a review; any other, such as the bot removing its own
 # label (unlabeled), starts none. A payload without an action is treated as before: reviewed.
@@ -288,7 +293,7 @@ def issue_path(issue):
 def question_finding(issue):
     """Whether a finding is an unverified claim the model phrased as a question."""
     header = issue.get("issue_header") if isinstance(issue, dict) else None
-    return isinstance(header, str) and header.lstrip().lower().startswith("question")
+    return isinstance(header, str) and QUESTION_RE.match(header) is not None
 
 
 def finding_excluded(issue, patterns):
@@ -879,9 +884,22 @@ def lfs_pointer_files(client, files, *, head):
                 print(f"::warning::{name} could not be checked for a Git LFS pointer, so it is "
                       f"reviewed as it is: {error}")
                 continue
-        if isinstance(text, str) and LFS_POINTER in text:
+        if isinstance(text, str) and is_lfs_pointer(text, patch=changed.get("patch") is not None):
             found.append(name)
     return found
+
+
+def is_lfs_pointer(text, *, patch):
+    """Whether text is a Git LFS pointer file, or a diff whose new side is one: every line is a
+    pointer line and the version line is among them. A file that only quotes the pointer text is
+    ordinary content."""
+    lines = text.splitlines()
+    if patch:
+        # The new side of the diff: added and context lines, without hunk headers or removals.
+        lines = [line[1:] for line in lines if line[:1] in ("+", " ")]
+    lines = [line.strip() for line in lines if line.strip()]
+    return (bool(lines) and LFS_POINTER in lines
+            and all(LFS_POINTER_LINE_RE.fullmatch(line) for line in lines))
 
 
 def decision_blockers(client, review, excluded_patterns=(), *, converge=None, too_large=(),

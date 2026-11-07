@@ -175,6 +175,24 @@ class IgnoredFindingTests(unittest.TestCase):
         return {"relevant_file": path, "start_line": 1, "end_line": 1,
                 "issue_header": header, "issue_content": "c"}
 
+    def test_a_header_that_only_begins_with_the_word_question_still_blocks(self):
+        for header in ("Questionable null handling", "Questions around the retry limit"):
+            with self.subTest(header=header):
+                self.assertFalse(review_gate.question_finding(self.issue(header=header)))
+
+    def test_only_a_pointer_file_is_an_lfs_pointer(self):
+        oid = "oid sha256:" + "a" * 64
+        pointer = f"version https://git-lfs.github.com/spec/v1\n{oid}\nsize 12345\n"
+        self.assertTrue(review_gate.is_lfs_pointer(pointer, patch=False))
+        diff = ("@@ -0,0 +1,3 @@\n+version https://git-lfs.github.com/spec/v1\n"
+                f"+{oid}\n+size 12345")
+        self.assertTrue(review_gate.is_lfs_pointer(diff, patch=True))
+        quoted = 'LFS_POINTER = "version https://git-lfs.github.com/spec/v1"\n'
+        self.assertFalse(review_gate.is_lfs_pointer(quoted, patch=False))
+        hunk = ("@@ -1,2 +1,3 @@\n import re\n"
+                '+LFS_POINTER = "version https://git-lfs.github.com/spec/v1"\n context = 1')
+        self.assertFalse(review_gate.is_lfs_pointer(hunk, patch=True))
+
     def test_a_question_header_never_blocks(self):
         for header in ("Question: does the API accept this?", "question: which limit applies?",
                        "QUESTION: is the payload signed?"):
