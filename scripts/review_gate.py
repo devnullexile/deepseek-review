@@ -55,6 +55,13 @@ GENERIC_TITLE_WORDS = frozenset({
 SAME_POINT_SHARE = 0.5
 # File names given to the model as left out of its view; more are counted, not named.
 MAX_LEFT_OUT_NAMED = 40
+# The header of a Git LFS pointer file, whose real content is not in the repository.
+LFS_POINTER = "version https://git-lfs.github.com/spec/v1"
+# The lines of a Git LFS pointer file: its version, the object id and the object size.
+LFS_POINTER_LINE_RE = re.compile(r"(?:version https://git-lfs\.github\.com/spec/v1|oid sha256:[0-9a-f]+"
+                                 r"|size [0-9]+)")
+# The documented marker of an unverified claim: "Question:" at the start of the header.
+QUESTION_RE = re.compile(r"\s*question\s*:", re.IGNORECASE)
 REVIEW_TRIGGERS = ("push", "label")
 # The pull request events that can ask for a review; any other, such as the bot removing its own
 # label (unlabeled), starts none. A payload without an action is treated as before: reviewed.
@@ -98,12 +105,14 @@ def _security_concern(value):
     return str(value).strip().lower() not in NEGATIVE_SECURITY_ANSWERS
 
 
-def approval_blockers(output, blocking_issues=None):
+def approval_blockers(output, blocking_issues=None, *, review_excluded=(), max_findings=0):
     """Return reasons that prevent approval; an empty list means approve.
 
     The check fails closed: anything missing or unexpected blocks approval. With
     blocking_issues (a later review that converges), only those findings block, and the merge
-    recommendation is advisory when the review has findings and none of them blocks.
+    recommendation is advisory when the review has findings and none of them blocks. A finding on
+    a path left out of the review, or one phrased as a question, never blocks. When max_findings is
+    set, only that many findings block, in the model's order.
     """
     if not isinstance(output, dict) or not isinstance(output.get("review"), dict):
         return ["review output is missing or malformed"]
@@ -112,21 +121,33 @@ def approval_blockers(output, blocking_issues=None):
 
     recommendation = review.get("merge_recommendation")
     issues = review.get("key_issues_to_review")
+    considered = ([issue for issue in issues
+                   if not finding_excluded(issue, review_excluded) and not question_finding(issue)]
+                  if isinstance(issues, list) else [])
     if blocking_issues is None:
-        if recommendation != "no_concerns_found":
+        blocking = considered[:max_findings] if max_findings else considered
+        # When every finding was left out of the review or asked as a question, the verdict it
+        # produced is advisory: there is no reviewable finding left to block.
+        if recommendation != "no_concerns_found" and not (isinstance(issues, list) and issues
+                                                          and not considered):
             blockers.append(f"merge recommendation is {recommendation!r}")
         if not isinstance(issues, list):
             blockers.append("key issues are missing")
-        elif issues:
-            blockers.append(f"{len(issues)} key issue(s) reported")
-    elif not isinstance(issues, list):
-        blockers.append("key issues are missing")
-    elif blocking_issues:
-        blockers.append(f"merge recommendation is {recommendation!r}")
-        blockers.append(f"{len(blocking_issues)} finding(s) on lines changed since the last review")
-    elif not issues and recommendation != "no_concerns_found":
-        # With no finding at all the verdict is the only signal, so it still blocks.
-        blockers.append(f"merge recommendation is {recommendation!r}")
+        elif blocking:
+            blockers.append(f"{len(blocking)} key issue(s) reported")
+    else:
+        blocking = [issue for issue in blocking_issues
+                    if not finding_excluded(issue, review_excluded) and not question_finding(issue)]
+        if max_findings:
+            blocking = blocking[:max_findings]
+        if not isinstance(issues, list):
+            blockers.append("key issues are missing")
+        elif blocking:
+            blockers.append(f"merge recommendation is {recommendation!r}")
+            blockers.append(f"{len(blocking)} finding(s) on lines changed since the last review")
+        elif not issues and recommendation != "no_concerns_found":
+            # With no finding at all the verdict is the only signal, so it still blocks.
+            blockers.append(f"merge recommendation is {recommendation!r}")
 
     if _security_concern(review.get("security_concerns")):
         blockers.append("security concerns reported")
@@ -269,6 +290,36 @@ def issue_path(issue):
     return path.strip().strip("`").strip().lstrip("/") or None
 
 
+def question_finding(issue):
+    """Whether a finding is an unverified claim the model phrased as a question."""
+    header = issue.get("issue_header") if isinstance(issue, dict) else None
+    return isinstance(header, str) and QUESTION_RE.match(header) is not None
+
+
+class LeftOutPaths(frozenset):
+    """Paths left out of the model review, and the globs that leave paths out (ignore-globs):
+    a path is in it when it is listed or matches a glob, so an earlier thread on a path the
+    model cannot see never blocks."""
+
+    def __new__(cls, paths=(), patterns=()):
+        self = super().__new__(cls, paths)
+        self.patterns = tuple(p for p in patterns if isinstance(p, str))
+        return self
+
+    def __contains__(self, path):
+        return super().__contains__(path) or (
+            isinstance(path, str) and any(fnmatch.fnmatchcase(path, p) for p in self.patterns))
+
+
+def finding_excluded(issue, patterns):
+    """Whether a finding is on a path left out of the model review."""
+    path = issue_path(issue)
+    if not path:
+        return False
+    return path in (patterns or ()) or any(
+        fnmatch.fnmatchcase(path, pattern) for pattern in patterns or ())
+
+
 def _where(issue):
     where = issue_path(issue) or ""
     lines = _issue_lines(issue)
@@ -287,27 +338,35 @@ def _linked(label, url):
     return f"[{label}]({url})" if url and url.startswith(("https://", "http://")) else label
 
 
-def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None, reviewed_head="",
+def result_comment(*, head_sha, result, blockers, review, skipped, lfs=(), blocking=None, reviewed_head="",
                    resolved=0, earlier=(), repo_url="", repeats=(), reviews=0, max_blocking=0,
-                   advisory=(), too_large=(), capped=False, fixed=()):
+                   advisory=(), too_large=(), capped=False, fixed=(), review_excluded=(),
+                   excess=(), max_findings=0):
     """The bot's own result comment: what it decided, and a checklist of what to change.
 
-    blocking lists the findings that block approval in a converging review (None: all do).
-    earlier lists the bot's open threads from before this run. reviewed_head is the head this
-    decision covers, kept for the next review, with reviews (how many reviews decided something,
-    this one included) and advisory (threads opened for findings that did not block). capped says
-    that the review limit, max_blocking, kept the findings from blocking. repeats
-    pairs each finding that repeats an earlier one with that earlier thread. too_large names files
-    the model could not see. fixed lists the threads the bot judged fixed but could not resolve.
-    repo_url, when set, links files and threads.
+    blocking lists the findings that block approval in a converging review (None: all do, except
+    findings on excluded paths and questions). earlier lists the bot's open threads from before
+    this run. reviewed_head is the head this decision covers, kept for the next review, with reviews
+    (how many reviews decided something, this one included) and advisory (threads opened for
+    findings that did not block). capped says that the review limit, max_blocking, kept the
+    findings from blocking. repeats pairs each finding that repeats an earlier one with that earlier
+    thread. too_large names files the model could not see. fixed lists the threads the bot judged
+    fixed but could not resolve. review_excluded names paths left out of the model review, so their
+    findings do not block. excess lists findings beyond max_findings that did not block. repo_url,
+    when set, links files and threads.
     """
     output = review if isinstance(review, dict) else {}
     body = output.get("review") if isinstance(output.get("review"), dict) else {}
     issues = [i for i in body.get("key_issues_to_review") or [] if isinstance(i, dict)] \
         if isinstance(body.get("key_issues_to_review"), list) else []
-    blocking_issues = issues if blocking is None else [i for i in issues if any(i is b for b in blocking)]
+    if blocking is None:
+        blocking_issues = [i for i in issues
+                           if not finding_excluded(i, review_excluded) and not question_finding(i)]
+    else:
+        blocking_issues = [i for i in issues if any(i is b for b in blocking)]
     other_issues = [i for i in issues if not any(i is b for b in blocking_issues)]
     repeated = {id(issue): earlier_thread for issue, earlier_thread in repeats}
+    excess_ids = {id(issue) for issue in excess}
     items = []
     for issue in blocking_issues[:10]:
         where, span = _where(issue)
@@ -322,12 +381,21 @@ def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None
                       "model's findings no longer block approval (`max-blocking-reviews`); security "
                       "concerns, files not fully reviewed, open threads of the bot and paths a person "
                       "approves still do."])
+    if excess:
+        notes.append([f"Only the first {max_findings} findings block approval "
+                      "(`max-blocking-findings`); the rest are listed as not blocking."])
     if other_issues:
         paragraph = ["**Not blocking**:"]
         for issue in other_issues[:10]:
             where, span = _where(issue)
             link = _file_link(repo_url, head_sha, issue_path(issue), span)
-            if id(issue) in repeated:
+            if id(issue) in excess_ids:
+                why = f"beyond the first {max_findings} findings that can block (`max-blocking-findings`)"
+            elif question_finding(issue):
+                why = "asked as a question, so it does not block"
+            elif finding_excluded(issue, review_excluded):
+                why = "on a path left out of the review"
+            elif id(issue) in repeated:
                 why = f"repeats {_linked('an earlier finding', repeated[id(issue)].get('url') or '')}"
             elif capped:
                 why = "raised after the last review that can block"
@@ -347,6 +415,8 @@ def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None
                       f"see them: {_listed(list(too_large))}."])
     if skipped:
         notes.append([f"**For a person to check**, left out of the review as data files: {_listed(skipped)}."])
+    if lfs:
+        notes.append([f"**For a person to check**, stored in Git LFS and not shown to the model: {_listed(lfs)}."])
     if resolved:
         notes.append([f"**Done:** resolved {resolved} earlier thread(s) of the bot whose lines a later "
                       "commit changed, with no finding raised there again."])
@@ -524,13 +594,14 @@ def _issue_lines(issue):
     return (start, max(start, end)) if start > 0 else None
 
 
-def blocking_findings(client, review, previous_head, head):
+def blocking_findings(client, review, previous_head, head, *, excluded=()):
     """The findings of this review that block approval when it converges.
 
     A finding blocks when it is on a line added or changed since the previous review, because
     that code was not reviewed before. It also blocks, failing closed, when its file or lines
     cannot be read. A finding on code the previous review already saw does not block: it was
-    reported then, and an earlier thread that is still open blocks on its own.
+    reported then, and an earlier thread that is still open blocks on its own. A finding on a path
+    left out of the review (excluded), or one asked as a question, never blocks.
     """
     issues = _review_body(review).get("key_issues_to_review")
     if not isinstance(issues, list):
@@ -538,6 +609,8 @@ def blocking_findings(client, review, previous_head, head):
     changed = {}
     blocking = []
     for issue in issues:
+        if finding_excluded(issue, excluded) or question_finding(issue):
+            continue
         path = issue_path(issue)
         if path is None:
             blocking.append(issue)
@@ -753,13 +826,16 @@ def advisory_threads(issues, blocking, threads, *, bot_login, started):
 
 
 def converge_state(client, review, *, previous_head, head, bot_login, started, reviews=0,
-                   max_blocking=0, advisory=frozenset(), left_out=frozenset()):
+                   max_blocking=0, advisory=frozenset(), left_out=frozenset(), max_findings=0,
+                   excluded=frozenset()):
     """For a later review: the findings that block, the bot's open earlier threads, and why the
     other findings do not block.
 
     reviews counts the earlier reviews that decided something; once max_blocking of them did
     (0: no limit), no finding of the model blocks. A finding that repeats an earlier point does
-    not block either. Raises GitHubError when anything cannot be read; the caller then blocks.
+    not block either, nor does a question or a finding on an excluded path. At most max_findings
+    findings block (0: no limit), in the model's order; the rest are returned as excess. Raises
+    GitHubError when anything cannot be read; the caller then blocks.
     """
     threads = client.review_threads()
     issues = _review_body(review).get("key_issues_to_review")
@@ -767,10 +843,12 @@ def converge_state(client, review, *, previous_head, head, bot_login, started, r
     capped = bool(max_blocking) and reviews >= max_blocking
     repeats = repeated_findings(issues, threads, bot_login=bot_login, started=started,
                                 advisory=advisory, left_out=left_out)
-    blocking = [] if capped else [
-        issue for issue in blocking_findings(client, review, previous_head, head) or []
+    candidates = [] if capped else [
+        issue for issue in blocking_findings(client, review, previous_head, head, excluded=excluded) or []
         if id(issue) not in repeats]
-    return {"blocking": blocking, "capped": capped,
+    excess = candidates[max_findings:] if max_findings else []
+    blocking = candidates[:max_findings] if max_findings else candidates
+    return {"blocking": blocking, "excess": excess, "capped": capped,
             "repeats": [(issue, repeats[id(issue)]) for issue in issues if id(issue) in repeats],
             "earlier": open_earlier_findings(client, bot_login, started, threads=threads,
                                              advisory=advisory, left_out=left_out)}
@@ -802,16 +880,63 @@ def too_large_files(client, files, *, base, head):
     return found
 
 
-def decision_blockers(client, review, excluded_patterns=(), *, converge=None, too_large=()):
+def lfs_pointer_files(client, files, *, head):
+    """Changed files that hold a Git LFS pointer instead of their content, in GitHub's order.
+
+    The diff or the file at head shows the pointer text. A file whose content cannot be read is
+    left in the review, as before.
+    """
+    found = []
+    for changed in files:
+        name = changed.get("filename") or ""
+        if not name:
+            continue
+        text = changed.get("patch")
+        if text is None:
+            if changed.get("status") == "removed":
+                continue
+            # A pointer is a text file of at most three lines; GitHub reports a binary file as
+            # zero changed lines, so its content is never fetched.
+            changes = changed.get("changes")
+            if isinstance(changes, int) and not 0 < changes <= 3:
+                continue
+            try:
+                text = client.file_at(name, head)
+            except (GitHubError, OSError) as error:
+                print(f"::warning::{name} could not be checked for a Git LFS pointer, so it is "
+                      f"reviewed as it is: {error}")
+                continue
+        if isinstance(text, str) and is_lfs_pointer(text, patch=changed.get("patch") is not None):
+            found.append(name)
+    return found
+
+
+def is_lfs_pointer(text, *, patch):
+    """Whether text is a Git LFS pointer file, or a diff whose new side is one: every line is a
+    pointer line and the version line is among them. A file that only quotes the pointer text is
+    ordinary content."""
+    lines = text.splitlines()
+    if patch:
+        # The new side of the diff: added and context lines, without hunk headers or removals.
+        lines = [line[1:] for line in lines if line[:1] in ("+", " ")]
+    lines = [line.strip() for line in lines if line.strip()]
+    return (bool(lines) and LFS_POINTER in lines
+            and all(LFS_POINTER_LINE_RE.fullmatch(line) for line in lines))
+
+
+def decision_blockers(client, review, excluded_patterns=(), *, converge=None, too_large=(),
+                      review_excluded=(), max_findings=0):
     """Every reason that prevents approval of this review, including paths a person approves.
 
     converge, for a later review, holds the blocking findings and open earlier threads, or an
-    error that blocks approval. too_large names files the model could not see.
+    error that blocks approval. too_large names files the model could not see. review_excluded
+    names paths left out of the model review, and max_findings caps the findings that block.
     """
     if converge and converge.get("error"):
         return [f"earlier findings could not be checked ({converge['error']})"]
     blocking = converge.get("blocking") if converge else None
-    blockers = approval_blockers(review, blocking)
+    blockers = approval_blockers(review, blocking, review_excluded=review_excluded,
+                                 max_findings=max_findings)
     if converge and converge.get("earlier"):
         blockers.append(f"{len(converge['earlier'])} earlier finding(s) of the bot are not resolved")
     if too_large:
@@ -829,7 +954,8 @@ def decision_blockers(client, review, excluded_patterns=(), *, converge=None, to
 
 def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
                   excluded_patterns=(), approve=True, request_changes=False,
-                  report=lambda blocker: None, note="", converge=None, too_large=()):
+                  report=lambda blocker: None, note="", converge=None, too_large=(),
+                  review_excluded=(), max_findings=0):
     """Bring the bot's own review state in line with the latest review of an unchanged head.
 
     Approves a clean review (when approve is set), requests changes when the model says
@@ -851,7 +977,9 @@ def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
         return (latest is not None and latest.get("state") == state
                 and latest.get("commit_id") == head_sha_after)
 
-    blockers = decision_blockers(client, review, excluded_patterns, converge=converge, too_large=too_large)
+    blockers = decision_blockers(client, review, excluded_patterns, converge=converge,
+                                 too_large=too_large, review_excluded=review_excluded,
+                                 max_findings=max_findings)
     for blocker in blockers:
         report(blocker)
     short_sha = head_sha_after[:7]
@@ -1243,13 +1371,21 @@ def command_take_label():
               f"it again ({error}).")
 
 
-def left_out_note(paths):
-    """The instruction that tells the model which changed files it does not see, and why."""
-    if not paths:
+def left_out_note(paths, patterns=()):
+    """The instruction that tells the model which changed paths it does not see, and why."""
+    parts = []
+    if paths:
+        named = _listed(list(paths), MAX_LEFT_OUT_NAMED)
+        parts.append(f"These changed files are left out of this review, as data, because they are too "
+                     f"large to read, or as Git LFS pointers: {named}.")
+    if patterns:
+        named = _listed(list(patterns), MAX_LEFT_OUT_NAMED)
+        parts.append(f"These file patterns are left out of this review: {named}.")
+    if not parts:
         return ""
-    named = _listed(list(paths), MAX_LEFT_OUT_NAMED)
-    return (f"These changed files are left out of this review, as data or because they are too large to "
-            f"read: {named}. Do not report them, or a change in them, as missing from the pull request.\n")
+    parts.append("Files matching these were changed but are not shown to you. Do not report them as "
+                 "missing, unchanged, or inconsistent, and do not infer their content.")
+    return " ".join(parts) + "\n"
 
 
 def command_data_files():
@@ -1273,6 +1409,13 @@ def command_data_files():
     # A file the user's globs leave out is not reviewed anyway, and must not block approval.
     rest = [changed for changed in listed if changed.get("filename") not in found
             and not any(fnmatch.fnmatchcase(changed.get("filename") or "", glob) for glob in user_globs)]
+    lfs = []
+    if rest:
+        try:
+            lfs = lfs_pointer_files(client, rest, head=client.head_sha())
+        except (GitHubError, OSError) as error:
+            print(f"::warning::Git LFS pointers could not be found, so every file is reviewed ({error}).")
+    rest = [changed for changed in rest if changed.get("filename") not in lfs]
     large = []
     if any("patch" not in changed for changed in rest):
         try:
@@ -1280,23 +1423,32 @@ def command_data_files():
         except (GitHubError, OSError) as error:
             print(f"::warning::Files too large to review could not be found, so every file is reviewed ({error}).")
     # Files too large to review come first: the model must not see their wrong diff.
-    globs, kept = ignore_list(user_globs, large + found)
+    globs, kept = ignore_list(user_globs, large + found + lfs)
+    kept_large = [path for path in kept if path in large]
     skipped = [path for path in kept if path in found]
+    kept_lfs = [path for path in kept if path in lfs]
     # Each one blocks approval, also one that did not fit in the ignore list.
     too_large = large
-    if len(kept) < len(found) + len(large):
-        print(f"{len(found) + len(large) - len(kept)} more file(s) are reviewed: the ignore list is full.")
+    if len(kept) < len(found) + len(large) + len(lfs):
+        print(f"{len(found) + len(large) + len(lfs) - len(kept)} more file(s) are reviewed: the "
+              "ignore list is full.")
     for path in skipped:
         print(f"Leaving out of the review as data: {path}")
     for path in too_large:
         print(f"Leaving out of the review as too large for GitHub to send: {path}")
+    for path in kept_lfs:
+        print(f"Leaving out of the review as a Git LFS pointer: {path}")
+    # The approval step drops findings on the same paths, so the model cannot block on what it
+    # was not shown.
+    excluded = list(user_globs) + [escape_glob(path) for path in kept_large + skipped + kept_lfs]
     out = os.path.join(os.environ["RUNNER_TEMP"], "deepseek-review")
     os.makedirs(out, exist_ok=True)
-    for name, value in (("data-files.json", skipped), ("too-large-files.json", too_large)):
+    for name, value in (("data-files.json", skipped), ("too-large-files.json", too_large),
+                        ("lfs-files.json", kept_lfs), ("excluded-paths.json", excluded)):
         with open(os.path.join(out, name), "w", encoding="utf-8") as handle:
             json.dump(value, handle)
     with open(os.path.join(out, "left-out.txt"), "w", encoding="utf-8") as handle:
-        handle.write(left_out_note([path for path in kept if path in large] + skipped))
+        handle.write(left_out_note(kept_large + skipped + kept_lfs, patterns=user_globs))
     _set_outputs(**{"ignore-globs": json.dumps(globs) if globs else ""})
 
 
@@ -1356,6 +1508,11 @@ def _skipped_data_files(name="data-files.json"):
     return [name for name in value if isinstance(name, str)] if isinstance(value, list) else []
 
 
+def _excluded_paths():
+    """Globs and paths the data-files step left out of the model review."""
+    return _skipped_data_files("excluded-paths.json")
+
+
 def _whole_number(name, text):
     if not re.fullmatch(r"[0-9]+", text or ""):
         raise SystemExit(f"{name} must be a whole number, not {text!r}.")
@@ -1370,17 +1527,23 @@ def command_approve():
     converging = _true("CONVERGE", "true")
     resolving = _true("RESOLVE_FIXED_THREADS", "true")
     max_blocking = _whole_number("max-blocking-reviews", os.environ.get("MAX_BLOCKING_REVIEWS", "3"))
+    max_findings = _whole_number("max-blocking-findings",
+                                 os.environ.get("MAX_BLOCKING_FINDINGS", "3"))
     client = _client_from_env()
     review = _load_review(os.environ["REVIEW_JSON"])
     excluded = _split_list(os.environ.get("APPROVAL_EXCLUDED_PATHS", DEFAULT_EXCLUDED_PATHS))
+    review_excluded = _excluded_paths()
     skipped = _skipped_data_files()
     too_large = _skipped_data_files("too-large-files.json")
-    left_out = set(skipped) | set(too_large)
+    lfs = _skipped_data_files("lfs-files.json")
+    left_out = LeftOutPaths(set(skipped) | set(too_large) | set(lfs), review_excluded)
     head_sha_before = os.environ.get("HEAD_SHA_BEFORE", "")
     head_sha_after = client.head_sha()
     blockers = []
     note = (f" {len(skipped)} data file(s) were left out of the review for a person to check."
             if skipped else "")
+    if lfs:
+        note += f" {len(lfs)} Git LFS file(s) were not shown to the model, for a person to check."
     bot_login = os.environ["BOT_LOGIN"]
     started = os.environ.get("RUN_STARTED", "")
     unchanged = head_sha_before == head_sha_after
@@ -1414,27 +1577,41 @@ def command_approve():
             converge = converge_state(client, review, previous_head=earlier_head, head=head_sha_after,
                                       bot_login=bot_login, started=started, reviews=state["reviews"],
                                       max_blocking=max_blocking, advisory=state["advisory"] | fixed_ids,
-                                      left_out=left_out)
+                                      left_out=left_out, max_findings=max_findings,
+                                      excluded=review_excluded)
         except GitHubError as error:
             converge = {"error": str(error)}
     if converge and converge.get("capped"):
         print(f"Review {state['reviews'] + 1}: after {max_blocking} reviews, findings no longer block.")
+    # The first review has no earlier head to compare against, so its findings block directly.
+    first_blocking, first_excess = None, []
+    if converge is None:
+        issues = _review_body(review).get("key_issues_to_review")
+        issues = issues if isinstance(issues, list) else []
+        candidates = [issue for issue in issues
+                      if not finding_excluded(issue, review_excluded) and not question_finding(issue)]
+        first_excess = candidates[max_findings:] if max_findings else []
+        first_blocking = candidates[:max_findings] if max_findings else candidates
     if approve or request_changes:
         result = sync_approval(client, bot_login=bot_login,
                                head_sha_before=head_sha_before, head_sha_after=head_sha_after,
                                review=review, excluded_patterns=excluded, approve=approve,
                                request_changes=request_changes, note=note, converge=converge,
-                               too_large=too_large,
+                               too_large=too_large, review_excluded=review_excluded,
+                               max_findings=max_findings,
                                report=lambda blocker: (blockers.append(blocker),
                                                        print(f"Not approving: {blocker}")))
     else:
         result = "" if unchanged else "head-changed"
         if not result:
-            blockers = decision_blockers(client, review, excluded, converge=converge, too_large=too_large)
+            blockers = decision_blockers(client, review, excluded, converge=converge,
+                                         too_large=too_large, review_excluded=review_excluded,
+                                         max_findings=max_findings)
     print(f"Approval result: {result}")
     _set_outputs(result=result)
     if comment:
-        blocking = (converge or {}).get("blocking")
+        blocking = (converge or {}).get("blocking") if converge else first_blocking
+        excess = (converge or {}).get("excess") or [] if converge else first_excess
         # Only a usable review marks its head as seen; a failed one must not shrink the next.
         decided = result != "head-changed" and usable_review(review)
         advisory = set(state["advisory"]) | fixed_ids
@@ -1449,12 +1626,13 @@ def command_approve():
                 print(f"::warning::Threads for findings that do not block could not be recorded: {error}")
         post_result(client, bot_login, result_comment(
             head_sha=head_sha_after, result=result, blockers=blockers, review=review,
-            skipped=skipped, blocking=blocking, resolved=len(resolved),
+            skipped=skipped, lfs=lfs, blocking=blocking, resolved=len(resolved),
             earlier=(converge or {}).get("earlier") or [], repo_url=_repo_url(),
             reviewed_head=head_sha_after if decided else earlier_head,
             repeats=(converge or {}).get("repeats") or (), reviews=state["reviews"] + int(decided),
             max_blocking=max_blocking, advisory=advisory, too_large=too_large,
-            capped=bool((converge or {}).get("capped")), fixed=unresolved))
+            capped=bool((converge or {}).get("capped")), fixed=unresolved,
+            review_excluded=review_excluded, excess=excess, max_findings=max_findings))
 
 
 def _repo_url():

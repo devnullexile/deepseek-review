@@ -93,12 +93,14 @@ class FakeFiles:
 
 
 class ConvergeStateTests(unittest.TestCase):
-    def state(self, review, threads, reviews=1, limit=3, advisory=(), left_out=()):
+    def state(self, review, threads, reviews=1, limit=3, advisory=(), left_out=(),
+              max_findings=0, excluded=()):
         client = FakeFiles({("a.py", OLD): "x\ny\n", ("a.py", HEAD): "x\nY\n"})
         client.review_threads = lambda: threads
         return review_gate.converge_state(client, review, previous_head=OLD, head=HEAD, bot_login=BOT,
                                           started=STARTED, reviews=reviews, max_blocking=limit,
-                                          advisory=set(advisory), left_out=set(left_out))
+                                          advisory=set(advisory), left_out=set(left_out),
+                                          max_findings=max_findings, excluded=set(excluded))
 
     def test_a_repeat_on_changed_lines_does_not_block(self):
         issue = finding()
@@ -122,6 +124,19 @@ class ConvergeStateTests(unittest.TestCase):
         threads = [thread("T1"), thread("T2", line=9), thread("T3", path="data.json")]
         state = self.state(review_of(), threads, advisory={"T2"}, left_out={"data.json"})
         self.assertEqual([t["id"] for t in state["earlier"]], ["T1"])
+
+    def test_a_question_or_a_finding_on_a_left_out_path_does_not_block(self):
+        question = finding(header="Question: is this supported?")
+        left_out = finding(path="docs/a.png", header="Missing evidence")
+        state = self.state(review_of(question, left_out), [], excluded={"docs/*"})
+        self.assertEqual(state["blocking"], [])
+
+    def test_only_the_first_findings_block_and_the_rest_are_reported_as_excess(self):
+        issues = [finding(header=f"Bug {number}") for number in range(4)]
+        state = self.state(review_of(*issues), [], max_findings=2)
+        self.assertEqual(state["blocking"], issues[:2])
+        self.assertEqual(state["excess"], issues[2:])
+        self.assertEqual(self.state(review_of(*issues), [], max_findings=0)["blocking"], issues)
 
 
 class AdvisoryThreadTests(unittest.TestCase):
@@ -229,6 +244,45 @@ class LargeFileTests(unittest.TestCase):
         client = self.Contents({("old.rs", OLD): False,
                                 ("flaky.rs", HEAD): review_gate.GitHubError("502", status=502)})
         self.assertEqual(review_gate.too_large_files(client, files, base=OLD, head=HEAD), ["new.rs"])
+
+
+class LeftOutInstructionTests(unittest.TestCase):
+    LFS = "version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 12\n"
+
+    class Contents:
+        def __init__(self, contents):
+            self.contents = contents
+
+        def file_at(self, path, ref):
+            value = self.contents.get((path, ref))
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+    def test_a_pointer_in_a_patch_or_a_file_without_a_patch_is_found(self):
+        files = [{"filename": "a.png", "patch": "+" + self.LFS},
+                 {"filename": "b.png", "status": "modified", "changes": 3},
+                 {"filename": "c.rs", "patch": "+fn main() {}"}]
+        client = self.Contents({("b.png", HEAD): self.LFS})
+        self.assertEqual(review_gate.lfs_pointer_files(client, files, head=HEAD), ["a.png", "b.png"])
+
+    def test_a_binary_file_without_a_patch_is_not_fetched(self):
+        files = [{"filename": "big.png", "status": "added", "changes": 0}]
+
+        class Unreadable:
+            def file_at(self, path, ref):
+                raise AssertionError(f"{path} must not be fetched")
+        self.assertEqual(review_gate.lfs_pointer_files(Unreadable(), files, head=HEAD), [])
+
+    def test_the_note_names_globs_paths_and_lfs_files_with_the_rule(self):
+        note = review_gate.left_out_note(["assets/a.png"], patterns=["*.meta", "docs/*/evidence/*"])
+        for text in ("`assets/a.png`", "`*.meta`", "Git LFS", "Files matching these were changed",
+                     "Do not report them as missing, unchanged, or inconsistent"):
+            with self.subTest(text=text):
+                self.assertIn(text, note)
+
+    def test_the_note_is_empty_without_anything_to_name(self):
+        self.assertEqual(review_gate.left_out_note([], patterns=[]), "")
 
 
 class LoopCommandTests(ApiTestCase):
@@ -383,7 +437,81 @@ class LoopCommandTests(ApiTestCase):
                                                            IGNORE_GLOBS='["*.rs"]'))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads((self.tmp / "deepseek-review" / "too-large-files.json").read_text()), [])
-        self.assertEqual((self.tmp / "deepseek-review" / "left-out.txt").read_text(), "")
+        note = (self.tmp / "deepseek-review" / "left-out.txt").read_text()
+        # The model still needs to know the user's globs, but big.rs is not named as a file.
+        self.assertIn("`*.rs`", note)
+        self.assertNotIn("`big.rs`", note)
+
+    def test_data_files_tells_the_model_about_globs_data_and_lfs_files(self):
+        fake = self.start(files=[
+            {"filename": "uv.lock", "additions": 3, "changes": 3, "patch": "@@"},
+            {"filename": "assets/logo.png", "additions": 3, "changes": 3,
+             "patch": "@@\n+version https://git-lfs.github.com/spec/v1\n+oid sha256:abc\n+size 12"},
+            {"filename": "src/app.py", "additions": 2, "changes": 2, "patch": "@@"}])
+        result = self.run_cli("data-files", **self.api_env(
+            fake, RUNNER_TEMP=str(self.tmp), IGNORE_GLOBS='["*.meta"]'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        globs = json.loads(self.outputs()["ignore-globs"])
+        for path in ("*.meta", "uv.lock", "assets/logo.png"):
+            self.assertIn(path, globs)
+        excluded = json.loads((self.tmp / "deepseek-review" / "excluded-paths.json").read_text())
+        for path in ("*.meta", "uv.lock", "assets/logo.png"):
+            self.assertIn(path, excluded)
+        self.assertEqual(json.loads((self.tmp / "deepseek-review" / "lfs-files.json").read_text()),
+                         ["assets/logo.png"])
+        note = (self.tmp / "deepseek-review" / "left-out.txt").read_text()
+        for text in ("`*.meta`", "`uv.lock`", "`assets/logo.png`", "Git LFS",
+                     "Do not report them as missing, unchanged, or inconsistent"):
+            self.assertIn(text, note)
+
+    def test_a_finding_on_a_path_left_out_of_the_review_does_not_block(self):
+        fake = self.start()
+        (self.tmp / "deepseek-review").mkdir()
+        (self.tmp / "deepseek-review" / "excluded-paths.json").write_text(
+            json.dumps(["docs/evidence/*"]))
+        result = self.approve(fake, review_of(
+            finding(path="docs/evidence/shot.png", line=1, header="Missing evidence")))
+        self.assertIn("Approval result: approved", result.stdout)
+        _, _, rest = fake.comments[0]["body"].partition("**Not blocking**")
+        self.assertIn("path left out of the review", rest)
+
+    def test_a_question_finding_does_not_block_and_its_thread_is_advisory(self):
+        fake = self.start()
+        fake.threads = [{"id": "N1", "isResolved": False, "author": LOGIN,
+                         "createdAt": "2026-06-01T00:00:05Z", "path": "a.py",
+                         "originalLine": 1, "commit": HEAD}]
+        result = self.approve(fake, review_of(
+            finding(line=1, header="Question: does the API accept this payload?")))
+        self.assertIn("Approval result: approved", result.stdout)
+        _, _, rest = fake.comments[0]["body"].partition("**Not blocking**")
+        self.assertIn("asked as a question", rest)
+        self.assertIn("<!-- deepseek-review:advisory N1 -->", fake.comments[0]["body"])
+
+    def test_only_the_first_findings_block_and_the_rest_are_listed_as_not_blocking(self):
+        fake = self.start()
+        issues = [finding(path=f"f{number}.py", line=1, header=f"Bug {number}") for number in range(4)]
+        result = self.approve(fake, review_of(*issues))
+        self.assertIn("3 key issue(s) reported", result.stdout)
+        todo, _, rest = fake.comments[0]["body"].partition("**Not blocking**")
+        self.assertIn("`f3.py:1`", rest)
+        self.assertNotIn("`f3.py:1`", todo)
+        self.assertIn("max-blocking-findings", rest)
+
+    def test_zero_means_no_finding_cap(self):
+        fake = self.start()
+        issues = [finding(path=f"f{number}.py", line=1, header=f"Bug {number}") for number in range(4)]
+        result = self.approve(fake, review_of(*issues), MAX_BLOCKING_FINDINGS="0")
+        self.assertIn("4 key issue(s) reported", result.stdout)
+        self.assertNotIn("**Not blocking**", fake.comments[0]["body"])
+
+    def test_an_invalid_finding_cap_is_refused_before_any_change(self):
+        fake = self.start()
+        for value in ("many", "-1", ""):
+            with self.subTest(value=value):
+                result = self.approve(fake, CLEAN, MAX_BLOCKING_FINDINGS=value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("max-blocking-findings", result.stdout + result.stderr)
+        self.assertEqual(fake.writes(), [])
 
     def test_head_sha_reports_how_many_reviews_came_before(self):
         fake = self.start()

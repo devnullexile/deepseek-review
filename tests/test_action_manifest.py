@@ -19,7 +19,8 @@ COMMAND_ENV = {
     "head-sha": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN"},
     "approve": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN", "HEAD_SHA_BEFORE", "REVIEW_JSON",
                 "APPROVAL_EXCLUDED_PATHS", "APPROVE", "REQUEST_CHANGES", "RESULT_COMMENT",
-                "CONVERGE", "RUN_STARTED", "RESOLVE_FIXED_THREADS", "MAX_BLOCKING_REVIEWS"},
+                "CONVERGE", "RUN_STARTED", "RESOLVE_FIXED_THREADS", "MAX_BLOCKING_REVIEWS",
+                "MAX_BLOCKING_FINDINGS"},
     "data-files": {"GH_TOKEN", "PR_NUMBER", "IGNORE_GLOBS", "SKIP_DATA_FILES", "DATA_FILE_LINES",
                    "APPROVAL_EXCLUDED_PATHS"},
     "take-label": {"GH_TOKEN", "PR_NUMBER", "REVIEW_LABEL"},
@@ -109,6 +110,18 @@ class ActionManifestTests(unittest.TestCase):
     def test_the_model_is_told_not_to_report_what_it_cannot_see_as_missing(self):
         [review_step] = [step for step in self.steps if "docker run" in step.get("run", "")]
         self.assertIn("you cannot see is missing", " ".join(review_step["env"]["BASE_INSTRUCTIONS"].split()))
+
+    def test_unverified_external_claims_must_be_questions(self):
+        [review_step] = [step for step in self.steps if "docker run" in step.get("run", "")]
+        base = " ".join(review_step["env"]["BASE_INSTRUCTIONS"].split())
+        self.assertIn("phrased as a question", base)
+        self.assertIn('header that starts with "Question:"', base)
+
+    def test_the_finding_cap_is_an_input_with_a_safe_default(self):
+        inputs = self.manifest["inputs"]
+        self.assertEqual(inputs["max-blocking-findings"]["default"], "3")
+        self.assertEqual(self.step("approval")["env"]["MAX_BLOCKING_FINDINGS"],
+                         "${{ inputs.max-blocking-findings }}")
 
     def step(self, step_id):
         [found] = [step for step in self.steps if step.get("id") == step_id]
