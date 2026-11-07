@@ -1,8 +1,12 @@
 """Reviews of one pull request end: a point already answered, a finding that did not block, a file
 the model cannot see and a long run of reviews never keep approval blocked round after round."""
+import contextlib
+import io
 import json
+import os
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -343,6 +347,20 @@ class LoopCommandTests(ApiTestCase):
         self.assertEqual(reopened.returncode, 0, reopened.stderr)
         self.assertIn("Approval result: not-approved", reopened.stdout)
         self.assertIn("- [ ] Fix it in a commit", fake.comments[0]["body"])
+
+    def test_a_recheck_api_error_is_a_warning_not_a_failed_run(self):
+        class Failing:
+            def head_sha(self):
+                raise review_gate.GitHubError("HTTP 502", status=502)
+        env = {"BOT_LOGIN": BOT, "APPROVE": "true", "REQUEST_CHANGES": "true", "RESULT_COMMENT": "true"}
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(review_gate, "_client_from_env", return_value=Failing()), \
+                mock.patch.object(review_gate, "_set_outputs") as outputs, \
+                contextlib.redirect_stdout(out):
+            review_gate.command_recheck()
+        self.assertIn("::warning::The recheck could not read or update", out.getvalue())
+        outputs.assert_called_once_with(result="")
 
     def test_the_thread_this_run_opens_for_a_finding_that_does_not_block_is_remembered(self):
         fake = self.start()

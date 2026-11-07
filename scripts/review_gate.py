@@ -1552,7 +1552,18 @@ def _repo_url():
 def command_recheck():
     """Decide again on the reviewed head without the model, after a person resolved or reopened
     threads: the review's own blockers, kept in the result comment, plus the bot's earlier threads
-    that are open now. A head the bot has not reviewed is left to the next review."""
+    that are open now. A head the bot has not reviewed is left to the next review. A GitHub API
+    error leaves the earlier decision in place, as a warning, rather than failing the run: the next
+    thread event or review decides again."""
+    try:
+        _recheck()
+    except GitHubError as error:
+        print(f"::warning::The recheck could not read or update the pull request, so the earlier "
+              f"decision stands ({error}).")
+        _set_outputs(result="")
+
+
+def _recheck():
     approve = _true("APPROVE", "true")
     request_changes = _true("REQUEST_CHANGES", "false")
     comment = _true("RESULT_COMMENT", "true")
