@@ -28,7 +28,7 @@ A GitHub Action that reviews pull requests with [pr-agent](https://github.com/qo
    The approval is pinned to the reviewed commit. In any other case, the bot withdraws (dismisses) its own earlier approvals. A failed review also withdraws them. Reviews by people are never touched.
 5. Optionally (`request-changes: "true"`), requests changes when the model's verdict is `changes_required`. A later approval by the bot supersedes the request. A later completed review with a softer verdict withdraws it. A failed review keeps it, so a merge that the request blocks stays blocked.
 
-6. Resolves its own threads that a later commit fixed (`resolve-fixed-threads`): the lines a thread pointed at were changed or removed, and the review of the new commit raised no finding there again. It replies in the thread first, saying which commit changed the lines.
+6. Resolves its own threads that a later commit fixed (`resolve-fixed-threads`): the lines a thread pointed at were changed or removed, and the review of the new commit raised no finding there again. It replies once after resolving. If it cannot resolve a fixed thread, that thread does not block approval and the result comment asks a person with write access to resolve it.
 7. Keeps one result comment up to date with what the bot decided on the latest commit and a checklist of what to change before it approves:
    - each blocking finding, with a link to its file and lines;
    - each earlier thread that is still open, with a link to it;
@@ -46,7 +46,7 @@ The approval is a signal, not a guarantee. A language model can miss defects, an
 
 1. Go to **Settings → Developer settings → GitHub Apps → New GitHub App**.
 2. Give it a name and logo. Disable **Webhook → Active**.
-3. Under **Repository permissions**, set **Contents: Read-only**, **Issues: Read and write** and **Pull requests: Read and write**.
+3. Under **Repository permissions**, set **Contents: Read and write**, **Issues: Read and write** and **Pull requests: Read and write**. GitHub requires Contents write access to resolve review threads. Accept this permission in the installation settings if upgrading an existing App. With Contents read-only, review and approval still work, but the bot cannot resolve fixed threads.
 4. Create the app. Note its **Client ID** (it starts with `Iv`) and generate a **private key**.
 5. To use the app in an organization, open **Advanced → Make public** and install the app on the organization. A public app does not expose your private key.
 
@@ -72,7 +72,7 @@ permissions: {}
 
 concurrency:
   group: deepseek-review-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && !github.event.changes.base && '-edit' || '' }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'pull_request_review_thread' }}
 
 jobs:
   review:
@@ -113,6 +113,20 @@ on:
 ```
 
 With `labeled` in the list, the `review` label also asks for a review in the default `push` mode.
+
+To update the result comment and approval after a person resolves or reopens a review thread, optionally add this event to the same workflow. It rechecks the previously reviewed commit without calling the model, using state in the result comment (`result-comment: "true"`, the default). A fork PR may receive no App secrets on this event; the action skips the recheck cleanly in that case.
+
+```yaml
+on:
+  pull_request_review_thread:
+    types: [resolved, unresolved]
+
+concurrency:
+  group: deepseek-review-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && !github.event.changes.base && '-edit' || '' }}
+  cancel-in-progress: ${{ github.event_name != 'pull_request_review_thread' }}
+```
+
+Keep the existing `pull_request_target` trigger alongside it. Callers that omit this event continue to recheck open threads during the next full review. Keep the shown concurrency setting so a thread event caused by the bot itself queues behind the active review instead of canceling it.
 
 ## Runner requirements
 

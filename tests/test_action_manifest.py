@@ -13,7 +13,7 @@ except ImportError:  # CI installs PyYAML and sets REQUIRE_PYYAML; see .github/w
 
 MANIFEST = Path(os.environ.get("ACTION_MANIFEST",
                                Path(__file__).resolve().parents[1] / "action.yml"))
-STEP_KEYS = {"name", "id", "if", "shell", "env", "run", "uses", "with"}
+STEP_KEYS = {"name", "id", "if", "shell", "env", "run", "uses", "with", "continue-on-error"}
 COMMAND_ENV = {
     "gate": {"ALLOWED_AUTHORS", "IGNORE_GLOBS", "GH_TOKEN", "MEMBERS_ONLY", "REVIEW_ON", "REVIEW_LABEL"},
     "head-sha": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN"},
@@ -24,6 +24,8 @@ COMMAND_ENV = {
                    "APPROVAL_EXCLUDED_PATHS"},
     "take-label": {"GH_TOKEN", "PR_NUMBER", "REVIEW_LABEL"},
     "stale": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN", "APPROVE", "RESULT_COMMENT", "REVIEW_LABEL"},
+    "recheck": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN", "APPROVAL_EXCLUDED_PATHS", "APPROVE",
+                "REQUEST_CHANGES", "RESULT_COMMENT"},
 }
 
 
@@ -109,6 +111,46 @@ class ActionManifestTests(unittest.TestCase):
     def test_the_model_is_told_not_to_report_what_it_cannot_see_as_missing(self):
         [review_step] = [step for step in self.steps if "docker run" in step.get("run", "")]
         self.assertIn("you cannot see is missing", " ".join(review_step["env"]["BASE_INSTRUCTIONS"].split()))
+
+    def step(self, step_id):
+        [found] = [step for step in self.steps if step.get("id") == step_id]
+        return found
+
+    def test_the_review_token_stays_read_only_for_contents(self):
+        # The gate, pr-agent and every other step keep the token they had; only resolving needs more.
+        token = self.step("token")
+        self.assertEqual(token["with"]["permission-contents"], "read")
+        self.assertIn("github.event_name == 'pull_request_review_thread'", token["continue-on-error"])
+        [review_step] = [step for step in self.steps if "docker run" in step.get("run", "")]
+        self.assertEqual(review_step["env"]["GITHUB__USER_TOKEN"], "${{ steps.token.outputs.token }}")
+
+    def test_the_token_that_resolves_threads_falls_back_to_the_read_only_one(self):
+        # An installation without Contents: Read and write must not fail the run.
+        resolve = self.step("resolve-token")
+        self.assertIs(resolve["continue-on-error"], True)
+        self.assertEqual(resolve["with"]["permission-contents"], "write")
+        self.assertEqual(resolve["with"]["client-id"], "${{ inputs.client-id || inputs.app-id }}")
+        self.assertIn("inputs.resolve-fixed-threads == 'true'", resolve["if"])
+        approval = self.step("approval")
+        self.assertEqual(approval["env"]["GH_TOKEN"],
+                         "${{ steps.resolve-token.outputs.token || steps.token.outputs.token }}")
+        ids = [step.get("id") for step in self.steps]
+        self.assertLess(ids.index("resolve-token"), ids.index("approval"))
+        [note] = [step for step in self.steps if "steps.resolve-token.outcome == 'failure'" in step.get("if", "")]
+        self.assertIn("::warning::", note["run"])
+        self.assertIn("Contents: Read and write", " ".join(note["run"].split()))
+
+    def test_a_recheck_calls_no_model_and_reports_its_result(self):
+        recheck = self.step("recheck")
+        self.assertIn("steps.gate.outputs.recheck == 'true'", recheck["if"])
+        self.assertIn("inputs.result-comment == 'true'", recheck["if"])
+        [review_step] = [step for step in self.steps if "docker run" in step.get("run", "")]
+        self.assertIn("steps.gate.outputs.run == 'true'", review_step["if"])
+        self.assertIn("steps.recheck.outputs.result", self.manifest["outputs"]["approval"]["value"])
+        self.assertNotIn("recheck-label", self.manifest["inputs"])
+        take = [step for step in self.steps if "take-label" in step.get("run", "")][0]
+        self.assertNotIn("steps.gate.outputs.recheck", take["if"])
+        self.assertEqual(take["env"]["REVIEW_LABEL"], "${{ inputs.review-label }}")
 
     def test_every_input_reference_is_declared(self):
         declared = set(self.manifest["inputs"])
