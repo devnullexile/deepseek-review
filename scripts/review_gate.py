@@ -338,7 +338,7 @@ def _linked(label, url):
     return f"[{label}]({url})" if url and url.startswith(("https://", "http://")) else label
 
 
-def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None, reviewed_head="",
+def result_comment(*, head_sha, result, blockers, review, skipped, lfs=(), blocking=None, reviewed_head="",
                    resolved=0, earlier=(), repo_url="", repeats=(), reviews=0, max_blocking=0,
                    advisory=(), too_large=(), capped=False, fixed=(), review_excluded=(),
                    excess=(), max_findings=0):
@@ -415,6 +415,8 @@ def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None
                       f"see them: {_listed(list(too_large))}."])
     if skipped:
         notes.append([f"**For a person to check**, left out of the review as data files: {_listed(skipped)}."])
+    if lfs:
+        notes.append([f"**For a person to check**, stored in Git LFS and not shown to the model: {_listed(lfs)}."])
     if resolved:
         notes.append([f"**Done:** resolved {resolved} earlier thread(s) of the bot whose lines a later "
                       "commit changed, with no finding raised there again."])
@@ -1540,6 +1542,8 @@ def command_approve():
     blockers = []
     note = (f" {len(skipped)} data file(s) were left out of the review for a person to check."
             if skipped else "")
+    if lfs:
+        note += f" {len(lfs)} Git LFS file(s) were not shown to the model, for a person to check."
     bot_login = os.environ["BOT_LOGIN"]
     started = os.environ.get("RUN_STARTED", "")
     unchanged = head_sha_before == head_sha_after
@@ -1622,7 +1626,7 @@ def command_approve():
                 print(f"::warning::Threads for findings that do not block could not be recorded: {error}")
         post_result(client, bot_login, result_comment(
             head_sha=head_sha_after, result=result, blockers=blockers, review=review,
-            skipped=skipped, blocking=blocking, resolved=len(resolved),
+            skipped=skipped, lfs=lfs, blocking=blocking, resolved=len(resolved),
             earlier=(converge or {}).get("earlier") or [], repo_url=_repo_url(),
             reviewed_head=head_sha_after if decided else earlier_head,
             repeats=(converge or {}).get("repeats") or (), reviews=state["reviews"] + int(decided),

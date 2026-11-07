@@ -193,6 +193,12 @@ class IgnoredFindingTests(unittest.TestCase):
             with self.subTest(header=header):
                 self.assertFalse(review_gate.question_finding(self.issue(header=header)))
 
+    def test_lfs_files_are_listed_for_a_person_to_check(self):
+        body = review_gate.result_comment(head_sha="a" * 40, result="approved", blockers=[],
+                                          review=clean_review(), skipped=[], lfs=["assets/a.png"])
+        self.assertIn("stored in Git LFS and not shown to the model", body)
+        self.assertIn("assets/a.png", body)
+
     def test_only_a_pointer_file_is_an_lfs_pointer(self):
         oid = "oid sha256:" + "a" * 64
         pointer = f"version https://git-lfs.github.com/spec/v1\n{oid}\nsize 12345\n"
