@@ -1,12 +1,8 @@
 """Reviews of one pull request end: a point already answered, a finding that did not block, a file
 the model cannot see and a long run of reviews never keep approval blocked round after round."""
-import contextlib
-import io
 import json
-import os
 import sys
 import unittest
-from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -148,14 +144,16 @@ class StateMarkerTests(unittest.TestCase):
         body = review_gate.result_comment(head_sha=HEAD, result="approved", blockers=[], review=CLEAN,
                                           skipped=[], reviewed_head=HEAD, reviews=4, advisory={"T2", "T1"})
         state = review_gate.parse_state(body)
-        self.assertEqual(state, {"head": HEAD, "reviews": 4, "advisory": {"T1", "T2"}})
+        self.assertEqual(state, {"head": HEAD, "reviews": 4, "advisory": {"T1", "T2"}, "fixed": set()})
 
     def test_a_stale_comment_keeps_them_too(self):
         body = review_gate.stale_comment("review", HEAD, reviews=2, advisory={"T9"})
-        self.assertEqual(review_gate.parse_state(body), {"head": HEAD, "reviews": 2, "advisory": {"T9"}})
+        self.assertEqual(review_gate.parse_state(body),
+                         {"head": HEAD, "reviews": 2, "advisory": {"T9"}, "fixed": set()})
 
     def test_no_comment_means_nothing_is_known(self):
-        self.assertEqual(review_gate.parse_state(""), {"head": "", "reviews": 0, "advisory": set()})
+        self.assertEqual(review_gate.parse_state(""),
+                         {"head": "", "reviews": 0, "advisory": set(), "fixed": set()})
 
     def test_the_comment_explains_a_finding_that_repeats_or_comes_after_the_last_blocking_review(self):
         repeat, late = finding(header="Duplicate asset IDs"), finding(line=5, header="Late")
@@ -299,7 +297,7 @@ class LoopCommandTests(ApiTestCase):
         body = fake.comments[0]["body"]
         self.assertIn("**For a person to resolve:**", body)
         self.assertNotIn("- [ ] Fix it in a commit", body)
-        self.assertEqual(review_gate.parse_recheck(body)["fixed"], ["T1"])
+        self.assertEqual(review_gate.parse_state(body)["fixed"], {"T1"})
         self.assertIn("T1", review_gate.parse_state(body)["advisory"])
         result = self.approve(fake, CLEAN)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -325,42 +323,6 @@ class LoopCommandTests(ApiTestCase):
         second = self.approve(fake, CLEAN)
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(len(fake.replies["T1"]), 1)
-
-    def test_review_thread_recheck_updates_approval_and_the_open_thread_checklist(self):
-        fake = self.start()
-        self.comment(fake, reviews=1)
-        fake.threads = [{"id": "T1", "isResolved": False, "author": LOGIN,
-                         "createdAt": BEFORE, "path": "a.py", "originalLine": 1, "commit": OLD}]
-        first = self.approve(fake, CLEAN)
-        self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertIn("Approval result: not-approved", first.stdout)
-        self.assertIn("- [ ] Fix it in a commit", fake.comments[0]["body"])
-        fake.threads[0]["isResolved"] = True
-        env = self.api_env(fake, BOT_LOGIN=BOT, APPROVAL_EXCLUDED_PATHS="",
-                           APPROVE="true", REQUEST_CHANGES="true", RESULT_COMMENT="true")
-        resolved = self.run_cli("recheck", **env)
-        self.assertEqual(resolved.returncode, 0, resolved.stderr)
-        self.assertIn("Approval result: approved", resolved.stdout)
-        self.assertNotIn("- [ ] Fix it in a commit", fake.comments[0]["body"])
-        fake.threads[0]["isResolved"] = False
-        reopened = self.run_cli("recheck", **env)
-        self.assertEqual(reopened.returncode, 0, reopened.stderr)
-        self.assertIn("Approval result: not-approved", reopened.stdout)
-        self.assertIn("- [ ] Fix it in a commit", fake.comments[0]["body"])
-
-    def test_a_recheck_api_error_is_a_warning_not_a_failed_run(self):
-        class Failing:
-            def head_sha(self):
-                raise review_gate.GitHubError("HTTP 502", status=502)
-        env = {"BOT_LOGIN": BOT, "APPROVE": "true", "REQUEST_CHANGES": "true", "RESULT_COMMENT": "true"}
-        out = io.StringIO()
-        with mock.patch.dict(os.environ, env), \
-                mock.patch.object(review_gate, "_client_from_env", return_value=Failing()), \
-                mock.patch.object(review_gate, "_set_outputs") as outputs, \
-                contextlib.redirect_stdout(out):
-            review_gate.command_recheck()
-        self.assertIn("::warning::The recheck could not read or update", out.getvalue())
-        outputs.assert_called_once_with(result="")
 
     def test_the_thread_this_run_opens_for_a_finding_that_does_not_block_is_remembered(self):
         fake = self.start()
@@ -439,7 +401,7 @@ class LoopCommandTests(ApiTestCase):
             def list_reviews(self):
                 raise review_gate.GitHubError("HTTP 502", status=502)
         self.assertEqual(review_gate.earlier_state(Failing(), BOT, HEAD),
-                         {"head": OLD, "reviews": 0, "advisory": set()})
+                         {"head": OLD, "reviews": 0, "advisory": set(), "fixed": set()})
 
     def test_a_stale_run_keeps_the_count_and_the_advisory_threads(self):
         fake = self.start()

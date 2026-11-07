@@ -252,28 +252,6 @@ class GateCommandTests(CliTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("pull_request", result.stdout + result.stderr)
 
-    def test_review_thread_events_recheck_without_starting_a_review(self):
-        for action in ("resolved", "unresolved"):
-            with self.subTest(action=action):
-                self.output.write_text("")
-                event = self.write_event({"action": action, "pull_request": {
-                    "number": 7, "html_url": "https://github.com/o/r/pull/7", "draft": False,
-                    "user": {"login": "alice"}, "author_association": "COLLABORATOR"}})
-                result = self.run_cli("gate", GITHUB_EVENT_NAME="pull_request_review_thread",
-                                      GITHUB_EVENT_PATH=event, GH_TOKEN="token")
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(self.outputs(), {"run": "false", "recheck": "true", "pr-number": "7"})
-
-    def test_review_thread_event_without_secrets_skips_cleanly(self):
-        event = self.write_event({"action": "resolved", "pull_request": {
-            "number": 7, "draft": False, "user": {"login": "alice"},
-            "author_association": "COLLABORATOR"}})
-        result = self.run_cli("gate", GITHUB_EVENT_NAME="pull_request_review_thread",
-                              GITHUB_EVENT_PATH=event, GH_TOKEN="")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.outputs(), {"run": "false"})
-        self.assertIn("no reviewer App token", result.stdout)
-
 
 class ApiTestCase(CliTestCase):
     """Helpers for commands that call the GitHub API; no tests of its own."""

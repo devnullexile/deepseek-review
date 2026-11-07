@@ -24,8 +24,6 @@ COMMAND_ENV = {
                    "APPROVAL_EXCLUDED_PATHS"},
     "take-label": {"GH_TOKEN", "PR_NUMBER", "REVIEW_LABEL"},
     "stale": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN", "APPROVE", "RESULT_COMMENT", "REVIEW_LABEL"},
-    "recheck": {"GH_TOKEN", "PR_NUMBER", "BOT_LOGIN", "APPROVAL_EXCLUDED_PATHS", "APPROVE",
-                "REQUEST_CHANGES", "RESULT_COMMENT"},
 }
 
 
@@ -120,7 +118,6 @@ class ActionManifestTests(unittest.TestCase):
         # The gate, pr-agent and every other step keep the token they had; only resolving needs more.
         token = self.step("token")
         self.assertEqual(token["with"]["permission-contents"], "read")
-        self.assertIn("github.event_name == 'pull_request_review_thread'", token["continue-on-error"])
         [review_step] = [step for step in self.steps if "docker run" in step.get("run", "")]
         self.assertEqual(review_step["env"]["GITHUB__USER_TOKEN"], "${{ steps.token.outputs.token }}")
 
@@ -139,18 +136,6 @@ class ActionManifestTests(unittest.TestCase):
         [note] = [step for step in self.steps if "steps.resolve-token.outcome == 'failure'" in step.get("if", "")]
         self.assertIn("::warning::", note["run"])
         self.assertIn("Contents: Read and write", " ".join(note["run"].split()))
-
-    def test_a_recheck_calls_no_model_and_reports_its_result(self):
-        recheck = self.step("recheck")
-        self.assertIn("steps.gate.outputs.recheck == 'true'", recheck["if"])
-        self.assertIn("inputs.result-comment == 'true'", recheck["if"])
-        [review_step] = [step for step in self.steps if "docker run" in step.get("run", "")]
-        self.assertIn("steps.gate.outputs.run == 'true'", review_step["if"])
-        self.assertIn("steps.recheck.outputs.result", self.manifest["outputs"]["approval"]["value"])
-        self.assertNotIn("recheck-label", self.manifest["inputs"])
-        take = [step for step in self.steps if "take-label" in step.get("run", "")][0]
-        self.assertNotIn("steps.gate.outputs.recheck", take["if"])
-        self.assertEqual(take["env"]["REVIEW_LABEL"], "${{ inputs.review-label }}")
 
     def test_every_input_reference_is_declared(self):
         declared = set(self.manifest["inputs"])
