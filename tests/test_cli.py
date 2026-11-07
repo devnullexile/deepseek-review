@@ -33,6 +33,8 @@ class FakeGitHub:
         self.labels = {"review"}
         self.threads = []  # {"isResolved", "author", "createdAt"}
         self.contents = {}  # (path, ref) -> text
+        self.replies = {}  # thread id -> [{"author": {"login"}, "body"}], replies after the first comment
+        self.forbid_resolve = False
         self.requests = []
         fake = self
 
@@ -97,11 +99,24 @@ class FakeGitHub:
                 body = self._body()
                 if self.path == "/graphql" and body["query"].lstrip().startswith("mutation"):
                     fake.requests.append(("POST", self.path, body, None))
+                    thread_id = body["variables"]["id"]
                     if "resolveReviewThread" in body["query"]:
+                        if fake.forbid_resolve:  # An app without Contents: Read and write.
+                            return self._send(200, {"data": {"resolveReviewThread": None}, "errors": [
+                                {"type": "FORBIDDEN", "path": ["resolveReviewThread"],
+                                 "message": "Resource not accessible by integration"}]})
                         for thread in fake.threads:
-                            if thread.get("id") == body["variables"]["id"]:
+                            if thread.get("id") == thread_id:
                                 thread["isResolved"] = True
+                    if "addPullRequestReviewThreadReply" in body["query"]:
+                        fake.replies.setdefault(thread_id, []).append(
+                            {"author": {"login": BOT.removesuffix("[bot]")}, "body": body["variables"]["body"]})
                     return self._send(200, {"data": {}})
+                if self.path == "/graphql" and "node(id:" in body["query"]:
+                    fake.requests.append(("GET", self.path, body, None))  # A read.
+                    return self._send(200, {"data": {"node": {"comments": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": fake.replies.get(body["variables"]["id"], [])}}}})
                 if self.path == "/graphql":
                     fake.requests.append(("GET", self.path, body, None))  # A read.
                     nodes = [{"id": t.get("id"), "isResolved": t["isResolved"], "path": t.get("path"),
@@ -236,6 +251,28 @@ class GateCommandTests(CliTestCase):
         result = self.run_cli("gate", GITHUB_EVENT_PATH=event, ALLOWED_AUTHORS="")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("pull_request", result.stdout + result.stderr)
+
+    def test_review_thread_events_recheck_without_starting_a_review(self):
+        for action in ("resolved", "unresolved"):
+            with self.subTest(action=action):
+                self.output.write_text("")
+                event = self.write_event({"action": action, "pull_request": {
+                    "number": 7, "html_url": "https://github.com/o/r/pull/7", "draft": False,
+                    "user": {"login": "alice"}, "author_association": "COLLABORATOR"}})
+                result = self.run_cli("gate", GITHUB_EVENT_NAME="pull_request_review_thread",
+                                      GITHUB_EVENT_PATH=event, GH_TOKEN="token")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.outputs(), {"run": "false", "recheck": "true", "pr-number": "7"})
+
+    def test_review_thread_event_without_secrets_skips_cleanly(self):
+        event = self.write_event({"action": "resolved", "pull_request": {
+            "number": 7, "draft": False, "user": {"login": "alice"},
+            "author_association": "COLLABORATOR"}})
+        result = self.run_cli("gate", GITHUB_EVENT_NAME="pull_request_review_thread",
+                              GITHUB_EVENT_PATH=event, GH_TOKEN="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs(), {"run": "false"})
+        self.assertIn("no reviewer App token", result.stdout)
 
 
 class ApiTestCase(CliTestCase):

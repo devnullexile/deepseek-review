@@ -280,6 +280,70 @@ class LoopCommandTests(ApiTestCase):
         self.assertIn("Approval result: approved", result.stdout)
         self.assertIn("<!-- deepseek-review:advisory T7 -->", fake.comments[0]["body"])
 
+    def test_fixed_thread_without_contents_write_does_not_block_or_get_a_reply(self):
+        fake = self.start()
+        self.comment(fake, reviews=1)
+        fake.contents = {("a.py", OLD): "old\n", ("a.py", HEAD): "new\n"}
+        fake.threads = [{"id": "T1", "isResolved": False, "author": LOGIN,
+                         "createdAt": BEFORE, "path": "a.py", "originalLine": 1, "commit": OLD}]
+        fake.forbid_resolve = True
+        result = self.approve(fake, CLEAN)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Approval result: approved", result.stdout)
+        self.assertFalse(fake.replies)
+        self.assertFalse(fake.threads[0]["isResolved"])
+        body = fake.comments[0]["body"]
+        self.assertIn("**For a person to resolve:**", body)
+        self.assertNotIn("- [ ] Fix it in a commit", body)
+        self.assertEqual(review_gate.parse_recheck(body)["fixed"], ["T1"])
+        self.assertIn("T1", review_gate.parse_state(body)["advisory"])
+        result = self.approve(fake, CLEAN)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Still not blocking on the next run (the fake keeps no approval record).
+        self.assertRegex(result.stdout, r"Approval result: (already-)?approved")
+        self.assertIn("**For a person to resolve:**", fake.comments[0]["body"])
+
+    def test_fixed_thread_is_resolved_before_reply_and_never_gets_a_duplicate(self):
+        fake = self.start()
+        self.comment(fake, reviews=1)
+        fake.contents = {("a.py", OLD): "old\n", ("a.py", HEAD): "new\n"}
+        fake.threads = [{"id": "T1", "isResolved": False, "author": LOGIN,
+                         "createdAt": BEFORE, "path": "a.py", "originalLine": 1, "commit": OLD}]
+        first = self.approve(fake, CLEAN)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        mutations = [body["query"] for method, path, body, _ in fake.requests
+                     if method == "POST" and path == "/graphql" and body["query"].startswith("mutation")]
+        self.assertEqual(len(mutations), 2)
+        self.assertIn("resolveReviewThread", mutations[0])
+        self.assertIn("addPullRequestReviewThreadReply", mutations[1])
+        self.assertEqual(len(fake.replies["T1"]), 1)
+        fake.threads[0]["isResolved"] = False
+        second = self.approve(fake, CLEAN)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(len(fake.replies["T1"]), 1)
+
+    def test_review_thread_recheck_updates_approval_and_the_open_thread_checklist(self):
+        fake = self.start()
+        self.comment(fake, reviews=1)
+        fake.threads = [{"id": "T1", "isResolved": False, "author": LOGIN,
+                         "createdAt": BEFORE, "path": "a.py", "originalLine": 1, "commit": OLD}]
+        first = self.approve(fake, CLEAN)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("Approval result: not-approved", first.stdout)
+        self.assertIn("- [ ] Fix it in a commit", fake.comments[0]["body"])
+        fake.threads[0]["isResolved"] = True
+        env = self.api_env(fake, BOT_LOGIN=BOT, APPROVAL_EXCLUDED_PATHS="",
+                           APPROVE="true", REQUEST_CHANGES="true", RESULT_COMMENT="true")
+        resolved = self.run_cli("recheck", **env)
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.assertIn("Approval result: approved", resolved.stdout)
+        self.assertNotIn("- [ ] Fix it in a commit", fake.comments[0]["body"])
+        fake.threads[0]["isResolved"] = False
+        reopened = self.run_cli("recheck", **env)
+        self.assertEqual(reopened.returncode, 0, reopened.stderr)
+        self.assertIn("Approval result: not-approved", reopened.stdout)
+        self.assertIn("- [ ] Fix it in a commit", fake.comments[0]["body"])
+
     def test_the_thread_this_run_opens_for_a_finding_that_does_not_block_is_remembered(self):
         fake = self.start()
         self.comment(fake, reviews=1)
