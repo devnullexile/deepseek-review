@@ -72,7 +72,7 @@ permissions: {}
 
 concurrency:
   group: deepseek-review-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && !github.event.changes.base && '-edit' || '' }}
-  cancel-in-progress: ${{ github.event_name != 'pull_request_review_thread' }}
+  cancel-in-progress: true
 
 jobs:
   review:
@@ -114,19 +114,7 @@ on:
 
 With `labeled` in the list, the `review` label also asks for a review in the default `push` mode.
 
-To update the result comment and approval after a person resolves or reopens a review thread, optionally add this event to the same workflow. It rechecks the previously reviewed commit without calling the model, using state in the result comment (`result-comment: "true"`, the default). A fork PR may receive no App secrets on this event; the action skips the recheck cleanly in that case.
-
-```yaml
-on:
-  pull_request_review_thread:
-    types: [resolved, unresolved]
-
-concurrency:
-  group: deepseek-review-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && !github.event.changes.base && '-edit' || '' }}
-  cancel-in-progress: ${{ github.event_name != 'pull_request_review_thread' }}
-```
-
-Keep the existing `pull_request_target` trigger alongside it. Callers that omit this event continue to recheck open threads during the next full review. Keep the shown concurrency setting so a thread event caused by the bot itself queues behind the active review instead of canceling it.
+A thread a person resolves or reopens is counted at the next review, which a push or the `review` label starts. GitHub Actions has no workflow event for resolving a review thread: `pull_request_review_thread` is a webhook event only and is not among the [events that trigger workflows](https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows), so do not add it to `on:`.
 
 ## Runner requirements
 

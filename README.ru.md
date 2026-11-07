@@ -72,7 +72,7 @@ permissions: {}
 
 concurrency:
   group: deepseek-review-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && !github.event.changes.base && '-edit' || '' }}
-  cancel-in-progress: ${{ github.event_name != 'pull_request_review_thread' }}
+  cancel-in-progress: true
 
 jobs:
   review:
@@ -114,19 +114,7 @@ on:
 
 Если `labeled` есть в списке, метка `review` запрашивает ревью и в режиме `push` по умолчанию.
 
-Чтобы обновлять итоговый комментарий и approve после закрытия или повторного открытия обсуждения человеком, можно добавить в тот же workflow событие ниже. Оно перепроверяет уже просмотренный коммит без вызова модели по состоянию в итоговом комментарии (`result-comment: "true"` по умолчанию). Для PR из форка это событие может не получить секреты приложения; тогда бот пропустит перепроверку без ошибки.
-
-```yaml
-on:
-  pull_request_review_thread:
-    types: [resolved, unresolved]
-
-concurrency:
-  group: deepseek-review-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && !github.event.changes.base && '-edit' || '' }}
-  cancel-in-progress: ${{ github.event_name != 'pull_request_review_thread' }}
-```
-
-Существующий триггер `pull_request_target` нужно сохранить. Без нового события открытые обсуждения перепроверяются при следующем полном ревью. Сохраните показанную настройку конкурентности: событие, созданное самим ботом, будет ждать завершения текущего ревью и не отменит его.
+Обсуждение, которое человек закрыл или открыл снова, учитывается при следующем ревью: его запускает push или метка `review`. В GitHub Actions нет события workflow для закрытия обсуждения ревью: `pull_request_review_thread` существует только как webhook и не входит в [события, запускающие workflow](https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows), поэтому не добавляйте его в `on:`.
 
 ## Требования к раннеру
 
