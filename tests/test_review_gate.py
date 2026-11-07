@@ -170,6 +170,56 @@ class ApprovalBlockerTests(unittest.TestCase):
         self.assertTrue(review_gate.approval_blockers(review))
 
 
+class IgnoredFindingTests(unittest.TestCase):
+    def issue(self, path="a.py", header="Bug"):
+        return {"relevant_file": path, "start_line": 1, "end_line": 1,
+                "issue_header": header, "issue_content": "c"}
+
+    def test_a_question_header_never_blocks(self):
+        for header in ("Question: does the API accept this?", "question: which limit applies?",
+                       "QUESTION: is the payload signed?"):
+            with self.subTest(header=header):
+                review = clean_review(merge_recommendation="changes_required",
+                                      key_issues_to_review=[self.issue(header=header)])
+                self.assertEqual(review_gate.approval_blockers(review), [])
+                self.assertTrue(review_gate.question_finding(self.issue(header=header)))
+
+    def test_a_finding_on_a_path_left_out_of_the_review_never_blocks(self):
+        review = clean_review(merge_recommendation="changes_required",
+                              key_issues_to_review=[self.issue(path="docs/evidence/a.png")])
+        self.assertEqual(review_gate.approval_blockers(
+            review, review_excluded=["docs/evidence/*"]), [])
+        self.assertTrue(review_gate.approval_blockers(review))
+
+    def test_a_normal_finding_still_blocks(self):
+        review = clean_review(merge_recommendation="changes_required",
+                              key_issues_to_review=[self.issue(header="Off by one")])
+        self.assertIn("1 key issue(s) reported", review_gate.approval_blockers(review))
+
+    def test_the_first_findings_block_up_to_the_limit(self):
+        issues = [self.issue(header=f"Bug {number}") for number in range(4)]
+        review = clean_review(merge_recommendation="changes_required", key_issues_to_review=issues)
+        blockers = review_gate.approval_blockers(review, max_findings=2)
+        self.assertIn("2 key issue(s) reported", blockers)
+        self.assertEqual(review_gate.approval_blockers(review, max_findings=0)[1],
+                         "4 key issue(s) reported")
+
+    def test_the_comment_explains_why_an_ignored_finding_does_not_block(self):
+        question, left_out, excess = (self.issue("a.py", "Question: is this supported?"),
+                                      self.issue("docs/a.png", "Missing evidence"),
+                                      self.issue("b.py", "Later finding"))
+        body = review_gate.result_comment(
+            head_sha=HEAD, result="not-approved", review=clean_review(
+                merge_recommendation="changes_required",
+                key_issues_to_review=[question, left_out, excess]),
+            skipped=[], blockers=["x"], blocking=[], review_excluded=["docs/*"],
+            max_findings=1, excess=[excess])
+        _, _, rest = body.partition("**Not blocking**")
+        self.assertIn("asked as a question", rest)
+        self.assertIn("path left out of the review", rest)
+        self.assertIn("max-blocking-findings", rest)
+
+
 class PathBlockerTests(unittest.TestCase):
     def test_matching_files_block_and_are_named(self):
         files = [{"filename": "src/app.py"}, {"filename": ".github/workflows/ci.yml"}]
