@@ -893,6 +893,11 @@ def lfs_pointer_files(client, files, *, head):
         if text is None:
             if changed.get("status") == "removed":
                 continue
+            # A pointer is a text file of at most three lines; GitHub reports a binary file as
+            # zero changed lines, so its content is never fetched.
+            changes = changed.get("changes")
+            if isinstance(changes, int) and not 0 < changes <= 3:
+                continue
             try:
                 text = client.file_at(name, head)
             except (GitHubError, OSError) as error:

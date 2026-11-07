@@ -266,6 +266,14 @@ class LeftOutInstructionTests(unittest.TestCase):
         client = self.Contents({("b.png", HEAD): self.LFS})
         self.assertEqual(review_gate.lfs_pointer_files(client, files, head=HEAD), ["a.png", "b.png"])
 
+    def test_a_binary_file_without_a_patch_is_not_fetched(self):
+        files = [{"filename": "big.png", "status": "added", "changes": 0}]
+
+        class Unreadable:
+            def file_at(self, path, ref):
+                raise AssertionError(f"{path} must not be fetched")
+        self.assertEqual(review_gate.lfs_pointer_files(Unreadable(), files, head=HEAD), [])
+
     def test_the_note_names_globs_paths_and_lfs_files_with_the_rule(self):
         note = review_gate.left_out_note(["assets/a.png"], patterns=["*.meta", "docs/*/evidence/*"])
         for text in ("`assets/a.png`", "`*.meta`", "Git LFS", "Files matching these were changed",
