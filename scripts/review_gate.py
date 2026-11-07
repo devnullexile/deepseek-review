@@ -296,6 +296,21 @@ def question_finding(issue):
     return isinstance(header, str) and QUESTION_RE.match(header) is not None
 
 
+class LeftOutPaths(frozenset):
+    """Paths left out of the model review, and the globs that leave paths out (ignore-globs):
+    a path is in it when it is listed or matches a glob, so an earlier thread on a path the
+    model cannot see never blocks."""
+
+    def __new__(cls, paths=(), patterns=()):
+        self = super().__new__(cls, paths)
+        self.patterns = tuple(p for p in patterns if isinstance(p, str))
+        return self
+
+    def __contains__(self, path):
+        return super().__contains__(path) or (
+            isinstance(path, str) and any(fnmatch.fnmatchcase(path, p) for p in self.patterns))
+
+
 def finding_excluded(issue, patterns):
     """Whether a finding is on a path left out of the model review."""
     path = issue_path(issue)
@@ -1514,7 +1529,7 @@ def command_approve():
     skipped = _skipped_data_files()
     too_large = _skipped_data_files("too-large-files.json")
     lfs = _skipped_data_files("lfs-files.json")
-    left_out = set(skipped) | set(too_large) | set(lfs)
+    left_out = LeftOutPaths(set(skipped) | set(too_large) | set(lfs), review_excluded)
     head_sha_before = os.environ.get("HEAD_SHA_BEFORE", "")
     head_sha_after = client.head_sha()
     blockers = []

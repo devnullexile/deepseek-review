@@ -175,6 +175,19 @@ class IgnoredFindingTests(unittest.TestCase):
         return {"relevant_file": path, "start_line": 1, "end_line": 1,
                 "issue_header": header, "issue_content": "c"}
 
+    def test_an_earlier_thread_on_an_ignored_glob_does_not_block(self):
+        threads = [{"id": "T1", "isResolved": False, "author": "bot", "createdAt": "2000-01-01T00:00:00Z",
+                    "path": "docs/x.md"},
+                   {"id": "T2", "isResolved": False, "author": "bot", "createdAt": "2000-01-01T00:00:00Z",
+                    "path": "src/a.py"}]
+        left_out = review_gate.LeftOutPaths({"data.json"}, ["docs/**"])
+        self.assertIn("docs/x.md", left_out)
+        self.assertIn("data.json", left_out)
+        self.assertNotIn("src/a.py", left_out)
+        open_threads = review_gate.open_earlier_findings(None, "bot[bot]", "2001-01-01T00:00:00Z",
+                                                         threads=threads, left_out=left_out)
+        self.assertEqual([t["id"] for t in open_threads], ["T2"])
+
     def test_a_header_that_only_begins_with_the_word_question_still_blocks(self):
         for header in ("Questionable null handling", "Questions around the retry limit"):
             with self.subTest(header=header):
