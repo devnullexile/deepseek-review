@@ -39,18 +39,12 @@ HEAD_MARKER_RE = re.compile(r"<!-- deepseek-review:head ([0-9a-f]{40}) -->")
 # for findings that did not block, so they never block a later review either.
 REVIEWS_MARKER_RE = re.compile(r"<!-- deepseek-review:reviews ([0-9]+) -->")
 ADVISORY_MARKER_RE = re.compile(r"<!-- deepseek-review:advisory ([A-Za-z0-9_=\- ]*) -->")
-# What a recheck needs to repeat the decision without the model: the blockers other than open
-# threads, the earlier threads that block while open, and the fixed threads the bot could not
-# resolve. Base64 of JSON, so no text in it can end the comment.
-RECHECK_MARKER_RE = re.compile(r"<!-- deepseek-review:recheck ([A-Za-z0-9_=-]*) -->")
-EARLIER_BLOCKER_RE = re.compile(r"^\d+ earlier finding\(s\) of the bot are not resolved$")
+# The fixed threads the bot could not resolve, so they stay non-blocking and listed on later runs.
+FIXED_MARKER_RE = re.compile(r"<!-- deepseek-review:fixed ([A-Za-z0-9_=\- ]*) -->")
 # The bot's reply in a thread it resolved; a thread that has one never gets another.
 RESOLVED_REPLY = "Resolved by the bot:"
-# Lines of the result comment a recheck keeps or replaces; untrusted text never starts a line.
 FINDING_ITEM = "- [ ] Fix, or answer in its thread: "
-MORE_FINDINGS_RE = re.compile(r"^- \[ \] And \d+ more findings in the review comment\.$")
 FIXED_NOTE = "**For a person to resolve:**"
-RECHECK_NOTE = "_Rechecked "
 RESULT_FOOTER = "_This comment is updated on every review. The review comment and its threads have the details._"
 # Words that say nothing about which point a finding makes, so two titles never match on them alone.
 GENERIC_TITLE_WORDS = frozenset({
@@ -232,11 +226,6 @@ def review_wanted(event, *, trigger, label):
     return True, False, False, f"the pull request was {action or 'updated'}"
 
 
-def recheck_wanted(event, event_name):
-    """A resolved or reopened review thread asks to recheck the current decision."""
-    return event_name == "pull_request_review_thread" and event.get("action") in ("resolved", "unresolved")
-
-
 def _one_line(text, limit):
     text = " ".join(str(text or "").split())
     # A comment must not end our marker or mention a person.
@@ -300,7 +289,7 @@ def _linked(label, url):
 
 def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None, reviewed_head="",
                    resolved=0, earlier=(), repo_url="", repeats=(), reviews=0, max_blocking=0,
-                   advisory=(), too_large=(), capped=False, fixed=(), recheck=None):
+                   advisory=(), too_large=(), capped=False, fixed=()):
     """The bot's own result comment: what it decided, and a checklist of what to change.
 
     blocking lists the findings that block approval in a converging review (None: all do).
@@ -310,8 +299,7 @@ def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None
     that the review limit, max_blocking, kept the findings from blocking. repeats
     pairs each finding that repeats an earlier one with that earlier thread. too_large names files
     the model could not see. fixed lists the threads the bot judged fixed but could not resolve.
-    recheck, when set, is kept for a later recheck (see recheck_state). repo_url, when set, links
-    files and threads.
+    repo_url, when set, links files and threads.
     """
     output = review if isinstance(review, dict) else {}
     body = output.get("review") if isinstance(output.get("review"), dict) else {}
@@ -364,12 +352,14 @@ def result_comment(*, head_sha, result, blockers, review, skipped, blocking=None
                       "commit changed, with no finding raised there again."])
     return _render_result(head_sha=head_sha, result=result, blockers=blockers, items=items,
                           earlier=earlier, notes=notes, fixed=fixed,
-                          markers=state_markers(reviewed_head, reviews, advisory, recheck))
+                          markers=state_markers(reviewed_head, reviews, advisory,
+                                                fixed=[t.get("id") for t in fixed
+                                                       if isinstance(t, dict)]))
 
 
-def _render_result(*, head_sha, result, blockers, items, earlier, notes, fixed, markers, rechecked=False):
+def _render_result(*, head_sha, result, blockers, items, earlier, notes, fixed, markers):
     """The result comment from its parts. items are the checklist lines of blocking findings and
-    notes the paragraphs below the checklist, both rendered from the review; a recheck keeps them."""
+    notes the paragraphs below the checklist, both rendered from the review."""
     title = RESULT_TITLES.get(result, "Not approved")
     if result == "" and blockers:  # Comment-only mode: the title follows the blockers.
         title = "Not approved"
@@ -404,8 +394,6 @@ def _render_result(*, head_sha, result, blockers, items, earlier, notes, fixed, 
                       f"them, so they do not block approval: {', '.join(shown)}{more}. A person with write "
                       "access can resolve them; the bot resolves them itself with the app permission "
                       "Contents: Read and write."]
-    if rechecked:
-        lines += ["", f"{RECHECK_NOTE}without a new review: the bot's threads were checked again._"]
     lines += ["", RESULT_FOOTER]
     return "\n".join(lines)
 
@@ -418,77 +406,32 @@ def stale_comment(label, reviewed_head="", reviews=0, advisory=()):
         "", "_This comment is updated on every review._"])
 
 
-def state_markers(reviewed_head="", reviews=0, advisory=(), recheck=None):
-    """The hidden lines that carry what the next review, or a recheck, needs to know."""
+def state_markers(reviewed_head="", reviews=0, advisory=(), fixed=()):
+    """The hidden lines that carry what the next review needs to know."""
     lines = [f"<!-- deepseek-review:head {reviewed_head} -->"] if reviewed_head else []
     if reviews:
         lines.append(f"<!-- deepseek-review:reviews {int(reviews)} -->")
     ids = sorted(i for i in advisory if re.fullmatch(r"[A-Za-z0-9_=-]+", str(i)))
     if ids:
         lines.append(f"<!-- deepseek-review:advisory {' '.join(ids)} -->")
-    if recheck is not None:
-        data = json.dumps(recheck, sort_keys=True, separators=(",", ":")).encode()
-        lines.append(f"<!-- deepseek-review:recheck {base64.urlsafe_b64encode(data).decode()} -->")
+    fixed_ids = sorted(i for i in fixed if re.fullmatch(r"[A-Za-z0-9_=-]+", str(i)))
+    if fixed_ids:
+        lines.append(f"<!-- deepseek-review:fixed {' '.join(fixed_ids)} -->")
     return lines
 
 
 def parse_state(body):
     """What a result comment remembers: the head it decided, how many reviews decided something,
-    and the threads opened for findings that did not block."""
+    the threads opened for findings that did not block, and the fixed threads it could not resolve."""
     body = body or ""
     head = HEAD_MARKER_RE.search(body)
     reviews = REVIEWS_MARKER_RE.search(body)
     advisory = ADVISORY_MARKER_RE.search(body)
+    fixed = FIXED_MARKER_RE.search(body)
     return {"head": head.group(1) if head else "",
             "reviews": int(reviews.group(1)) if reviews else 0,
-            "advisory": set(advisory.group(1).split()) if advisory else set()}
-
-
-def recheck_state(blockers, *, threads=(), fixed=()):
-    """What a recheck needs: every blocker but the open earlier threads, the earlier threads that
-    block while open (threads), and the fixed threads the bot could not resolve (fixed)."""
-    return {"others": [b for b in blockers if not EARLIER_BLOCKER_RE.match(b)],
-            "threads": [str(i) for i in threads if i], "fixed": sorted(str(i) for i in fixed if i)}
-
-
-def parse_recheck(body):
-    """The recheck state of a result comment, or None when it has none, as one of an older version
-    or of a review that decided nothing does not."""
-    found = RECHECK_MARKER_RE.search(body or "")
-    if not found:
-        return None
-    try:
-        value = json.loads(base64.urlsafe_b64decode(found.group(1)))
-    except ValueError:
-        return None
-    if not isinstance(value, dict):
-        return None
-    lists = [value.get(key) for key in ("others", "threads", "fixed")]
-    if not all(isinstance(items, list) and all(isinstance(i, str) for i in items) for items in lists):
-        return None
-    return dict(zip(("others", "threads", "fixed"), lists))
-
-
-def result_parts(body):
-    """The parts of a result comment a recheck keeps: its state markers, the checklist lines of the
-    blocking findings, and the paragraphs below the checklist other than the recheck's own."""
-    lines = (body or "").split("\n")
-    title = next((i for i, line in enumerate(lines) if line.startswith("### DeepSeek review:")), None)
-    if title is None:
-        return [], [], []
-    markers = [line for line in lines[1:title] if line.startswith("<!-- deepseek-review:")]
-    rest = lines[title + 2:]
-    cut = rest.index("") if "" in rest else len(rest)
-    items = [line for line in rest[:cut] if line.startswith(FINDING_ITEM) or MORE_FINDINGS_RE.match(line)]
-    notes, paragraph = [], []
-    for line in rest[cut + 1:] + [""]:
-        if line:
-            paragraph.append(line)
-            continue
-        if paragraph and not paragraph[0].startswith((FIXED_NOTE, RECHECK_NOTE, "_This comment is updated")):
-            notes.append(paragraph)
-        paragraph = []
-    return markers, items, notes
+            "advisory": set(advisory.group(1).split()) if advisory else set(),
+            "fixed": set(fixed.group(1).split()) if fixed else set()}
 
 
 def _own_result(client, bot_login):
@@ -721,25 +664,19 @@ def resolve_fixed_threads(client, review, *, head, bot_login, started, report=pr
     return resolved, unresolved
 
 
-def earlier_threads(threads, bot_login, started, *, advisory=(), left_out=()):
-    """The threads the bot opened before this run that block approval while they are open.
+def open_earlier_findings(client, bot_login, started, *, threads=None, advisory=(), left_out=()):
+    """Threads the bot opened before this run that nobody resolved: answered findings close.
 
     A thread opened for a finding that did not block (advisory) does not count, nor does one on a
     file left out of the review (left_out), which does not block approval either.
     """
     login = bot_login.removesuffix("[bot]")
-    return [thread for thread in threads
-            if ((thread.get("author") or "") == login)
+    return [thread for thread in (client.review_threads() if threads is None else threads)
+            if not thread.get("isResolved")
+            and ((thread.get("author") or "") == login)
             and (thread.get("created_at") or "") < started
             and thread.get("id") not in advisory
             and thread.get("path") not in left_out]
-
-
-def open_earlier_findings(client, bot_login, started, *, threads=None, advisory=(), left_out=()):
-    """Threads the bot opened before this run that nobody resolved: answered findings close."""
-    return [thread for thread in earlier_threads(client.review_threads() if threads is None else threads,
-                                                 bot_login, started, advisory=advisory, left_out=left_out)
-            if not thread.get("isResolved")]
 
 
 def finding_title(body):
@@ -833,12 +770,10 @@ def converge_state(client, review, *, previous_head, head, bot_login, started, r
     blocking = [] if capped else [
         issue for issue in blocking_findings(client, review, previous_head, head) or []
         if id(issue) not in repeats]
-    candidates = earlier_threads(threads, bot_login, started, advisory=advisory, left_out=left_out)
     return {"blocking": blocking, "capped": capped,
             "repeats": [(issue, repeats[id(issue)]) for issue in issues if id(issue) in repeats],
-            "earlier": [thread for thread in candidates if not thread.get("isResolved")],
-            # Resolved ones too: one a person reopens blocks again, in a recheck as in a review.
-            "candidates": [thread.get("id") for thread in candidates if thread.get("id")]}
+            "earlier": open_earlier_findings(client, bot_login, started, threads=threads,
+                                             advisory=advisory, left_out=left_out)}
 
 
 def too_large_files(client, files, *, base, head):
@@ -867,24 +802,20 @@ def too_large_files(client, files, *, base, head):
     return found
 
 
-def decision_blockers(client, review, excluded_patterns=(), *, converge=None, too_large=(), known=None):
+def decision_blockers(client, review, excluded_patterns=(), *, converge=None, too_large=()):
     """Every reason that prevents approval of this review, including paths a person approves.
 
     converge, for a later review, holds the blocking findings and open earlier threads, or an
-    error that blocks approval. too_large names files the model could not see. known, in a recheck,
-    replaces the reasons that come from the review; paths are still checked.
+    error that blocks approval. too_large names files the model could not see.
     """
     if converge and converge.get("error"):
         return [f"earlier findings could not be checked ({converge['error']})"]
-    if known is not None:
-        blockers = list(known)
-    else:
-        blocking = converge.get("blocking") if converge else None
-        blockers = approval_blockers(review, blocking)
-        if converge and converge.get("earlier"):
-            blockers.append(f"{len(converge['earlier'])} earlier finding(s) of the bot are not resolved")
-        if too_large:
-            blockers.append(f"{len(too_large)} file(s) too large to review; a person must review them")
+    blocking = converge.get("blocking") if converge else None
+    blockers = approval_blockers(review, blocking)
+    if converge and converge.get("earlier"):
+        blockers.append(f"{len(converge['earlier'])} earlier finding(s) of the bot are not resolved")
+    if too_large:
+        blockers.append(f"{len(too_large)} file(s) too large to review; a person must review them")
     if not blockers and excluded_patterns:
         files = client.list_files()
         expected = client.changed_file_count()
@@ -898,13 +829,12 @@ def decision_blockers(client, review, excluded_patterns=(), *, converge=None, to
 
 def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
                   excluded_patterns=(), approve=True, request_changes=False,
-                  report=lambda blocker: None, note="", converge=None, too_large=(), known=None):
+                  report=lambda blocker: None, note="", converge=None, too_large=()):
     """Bring the bot's own review state in line with the latest review of an unchanged head.
 
     Approves a clean review (when approve is set), requests changes when the model says
     changes are required (when request_changes is set), and withdraws the bot's earlier
-    verdicts that no longer hold. report() receives each reason that prevents approval. known, in
-    a recheck without review output, gives the blockers; a change request is then kept, never posted.
+    verdicts that no longer hold. report() receives each reason that prevents approval.
     """
     if not head_sha_before or head_sha_before != head_sha_after:
         return "head-changed"
@@ -921,8 +851,7 @@ def sync_approval(client, *, bot_login, head_sha_before, head_sha_after, review,
         return (latest is not None and latest.get("state") == state
                 and latest.get("commit_id") == head_sha_after)
 
-    blockers = decision_blockers(client, review, excluded_patterns, converge=converge, too_large=too_large,
-                                 known=known)
+    blockers = decision_blockers(client, review, excluded_patterns, converge=converge, too_large=too_large)
     for blocker in blockers:
         report(blocker)
     short_sha = head_sha_after[:7]
@@ -1265,19 +1194,7 @@ def command_gate():
         event = json.load(handle)
     pull_request = event.get("pull_request")
     if not isinstance(pull_request, dict):
-        raise SystemExit("This action must run on a pull_request, pull_request_target, or "
-                         "pull_request_review_thread event.")
-    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
-    rechecking = recheck_wanted(event, event_name)
-    if rechecking and not os.environ.get("GH_TOKEN"):
-        print("Skipping recheck: this event has no reviewer App token (fork pull requests may "
-              "not receive secrets).")
-        _set_outputs(run="false")
-        return
-    if rechecking:
-        print(f"Rechecking: a review thread was {event['action']}.")
-        _set_outputs(run="false", recheck="true", **{"pr-number": pull_request["number"]})
-        return
+        raise SystemExit("This action must run on a pull_request or pull_request_target event.")
     wanted, stale, requested, why = review_wanted(event, trigger=trigger, label=label)
     if not wanted and not stale:
         print(f"Skipping review: {why}")
@@ -1475,8 +1392,8 @@ def command_approve():
         if resolved:
             print(f"Resolved {len(resolved)} thread(s) of the bot that a later commit fixed.")
     # Keep earlier fixed-but-unresolved threads non-blocking across later reviews too.
-    previous = parse_recheck((_own_result(client, bot_login) or {}).get("body")) or {}
-    fixed_ids = set(previous.get("fixed", ())) | {thread["id"] for thread in unresolved}
+    previous = parse_state((_own_result(client, bot_login) or {}).get("body"))
+    fixed_ids = set(previous["fixed"]) | {thread["id"] for thread in unresolved}
     if fixed_ids:
         try:
             open_threads = {thread["id"]: thread for thread in client.review_threads()
@@ -1530,9 +1447,6 @@ def command_approve():
                     issues, blocking, threads, bot_login=bot_login, started=started)
             except GitHubError as error:
                 print(f"::warning::Threads for findings that do not block could not be recorded: {error}")
-        # Only a decision of this head can be rechecked; a failed review leaves nothing to recheck.
-        recheck = recheck_state(blockers, threads=(converge or {}).get("candidates") or (),
-                                fixed=fixed_ids) if decided else None
         post_result(client, bot_login, result_comment(
             head_sha=head_sha_after, result=result, blockers=blockers, review=review,
             skipped=skipped, blocking=blocking, resolved=len(resolved),
@@ -1540,7 +1454,7 @@ def command_approve():
             reviewed_head=head_sha_after if decided else earlier_head,
             repeats=(converge or {}).get("repeats") or (), reviews=state["reviews"] + int(decided),
             max_blocking=max_blocking, advisory=advisory, too_large=too_large,
-            capped=bool((converge or {}).get("capped")), fixed=unresolved, recheck=recheck))
+            capped=bool((converge or {}).get("capped")), fixed=unresolved))
 
 
 def _repo_url():
@@ -1549,69 +1463,9 @@ def _repo_url():
     return f"{server}/{repository}" if repository else ""
 
 
-def command_recheck():
-    """Decide again on the reviewed head without the model, after a person resolved or reopened
-    threads: the review's own blockers, kept in the result comment, plus the bot's earlier threads
-    that are open now. A head the bot has not reviewed is left to the next review. A GitHub API
-    error leaves the earlier decision in place, as a warning, rather than failing the run: the next
-    thread event or review decides again."""
-    try:
-        _recheck()
-    except GitHubError as error:
-        print(f"::warning::The recheck could not read or update the pull request, so the earlier "
-              f"decision stands ({error}).")
-        _set_outputs(result="")
-
-
-def _recheck():
-    approve = _true("APPROVE", "true")
-    request_changes = _true("REQUEST_CHANGES", "false")
-    comment = _true("RESULT_COMMENT", "true")
-    client = _client_from_env()
-    bot_login = os.environ["BOT_LOGIN"]
-    excluded = _split_list(os.environ.get("APPROVAL_EXCLUDED_PATHS", DEFAULT_EXCLUDED_PATHS))
-    head = client.head_sha()
-    body = (_own_result(client, bot_login) or {}).get("body") or ""
-    saved = parse_recheck(body)
-    if saved is None:
-        print("Nothing to recheck: the result comment holds no decision this version can recheck. "
-              "The next review decides.")
-        _set_outputs(result="")
-        return
-    if parse_state(body)["head"] != head:
-        print(f"Nothing to recheck: the bot has not reviewed {head[:7]} yet. The next review decides.")
-        _set_outputs(result="")
-        return
-    threads = {thread.get("id"): thread for thread in client.review_threads()
-               if thread.get("id") and not thread.get("isResolved")}
-    earlier = [threads[i] for i in saved["threads"] if i in threads]
-    fixed = [threads[i] for i in saved["fixed"] if i in threads]
-    blockers = list(saved["others"])
-    if earlier:
-        blockers.append(f"{len(earlier)} earlier finding(s) of the bot are not resolved")
-    if approve or request_changes:
-        reported = []
-        result = sync_approval(client, bot_login=bot_login, head_sha_before=head,
-                               head_sha_after=client.head_sha(), review=None, excluded_patterns=excluded,
-                               approve=approve, request_changes=request_changes, known=blockers,
-                               report=lambda blocker: (reported.append(blocker),
-                                                       print(f"Not approving: {blocker}")))
-        blockers = reported
-    else:
-        result = "" if client.head_sha() == head else "head-changed"
-        blockers = decision_blockers(client, None, excluded, known=blockers)
-    print(f"Approval result: {result}")
-    _set_outputs(result=result)
-    if comment and result != "head-changed":
-        markers, items, notes = result_parts(body)
-        post_result(client, bot_login, _render_result(
-            head_sha=head, result=result, blockers=blockers, items=items, earlier=earlier, notes=notes,
-            fixed=fixed, markers=markers, rechecked=True))
-
-
 COMMANDS = {"gate": command_gate, "head-sha": command_head_sha, "approve": command_approve,
             "data-files": command_data_files, "take-label": command_take_label,
-            "stale": command_stale, "recheck": command_recheck}
+            "stale": command_stale}
 
 
 def main(argv):

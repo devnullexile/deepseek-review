@@ -181,8 +181,7 @@ outputs:
     description: >-
       approved, already-approved, changes-requested, already-changes-requested, no-concerns,
       not-approved, head-changed, or empty when both approve and request-changes are disabled.
-      A recheck sets it too, and leaves it empty when there is nothing to recheck.
-    value: ${{ steps.approval.outputs.result || steps.recheck.outputs.result }}
+    value: ${{ steps.approval.outputs.result }}
 
 runs:
   using: composite
@@ -191,8 +190,6 @@ runs:
     - name: Create reviewer token
       id: token
       if: github.event.pull_request.draft == false
-      # Fork review-thread events have no privileged target variant and may have no app secrets.
-      continue-on-error: ${{ github.event_name == 'pull_request_review_thread' }}
       uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
       with:
         # Only client-id is passed: the token action deprecates app-id and warns whenever it is given,
@@ -227,23 +224,6 @@ runs:
         PR_NUMBER: ${{ steps.gate.outputs.pr-number }}
         REVIEW_LABEL: ${{ inputs.review-label }}
       run: python3 "$GITHUB_ACTION_PATH/scripts/review_gate.py" take-label
-
-    # A resolved or reopened review thread asks for a decision on the reviewed head, without a model call.
-    - name: Recheck the verdict
-      id: recheck
-      if: >-
-        steps.gate.outputs.recheck == 'true' && steps.token.outcome == 'success' &&
-        (inputs.approve == 'true' || inputs.request-changes == 'true' || inputs.result-comment == 'true')
-      shell: bash
-      env:
-        GH_TOKEN: ${{ steps.token.outputs.token }}
-        PR_NUMBER: ${{ steps.gate.outputs.pr-number }}
-        BOT_LOGIN: ${{ steps.token.outputs.app-slug }}[bot]
-        APPROVAL_EXCLUDED_PATHS: ${{ inputs.approval-excluded-paths }}
-        APPROVE: ${{ inputs.approve }}
-        REQUEST_CHANGES: ${{ inputs.request-changes }}
-        RESULT_COMMENT: ${{ inputs.result-comment }}
-      run: python3 "$GITHUB_ACTION_PATH/scripts/review_gate.py" recheck
 
     # In label mode a new commit is not reviewed, so an approval of older commits must not stay.
     - name: Withdraw approval of older commits
