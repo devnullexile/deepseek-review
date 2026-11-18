@@ -97,8 +97,8 @@ inputs:
     default: "true"
   max-blocking-reviews:
     description: >-
-      How many reviews of one pull request can block approval on the model's findings. Later
-      reviews still post their findings, but only security concerns, files not fully reviewed, the
+      How many reviews of one pull request can block approval on the model's findings and its merge
+      recommendation. Later reviews still post their findings, but only security concerns, files not fully reviewed, the
       bot's open threads from the blocking reviews and paths a person approves block. Needs converge.
       0 means no limit.
     required: false

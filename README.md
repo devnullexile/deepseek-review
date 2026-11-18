@@ -21,7 +21,7 @@ A GitHub Action that reviews pull requests with [pr-agent](https://github.com/qo
    So that a pull request does not go round after round, a later review also does not block on:
    - a finding that repeats one of the bot's earlier points on the same file, also in other words, when that thread is still open (it blocks on its own) or a person resolved it;
    - the bot's open threads for findings that did not block when they were raised, or on files left out of the review;
-   - any finding of the model once `max-blocking-reviews` (3) reviews of the pull request have decided something. The findings are still posted and listed; security concerns, files not fully reviewed, the bot's open threads from earlier reviews and protected paths still block;
+   - any finding of the model, and its merge recommendation even when it found nothing, once `max-blocking-reviews` (3) reviews of the pull request have decided something. The findings are still posted and listed; security concerns, files not fully reviewed, the bot's open threads from earlier reviews and protected paths still block;
    - findings beyond the first `max-blocking-findings` (3) of one review. They are still posted and listed as not blocking. `0` means no limit.
 
    A later review also tells the model that the author answered the earlier findings, so it reports only confirmed defects, mainly in changed code, and does not raise an answered point again.
@@ -149,7 +149,7 @@ To review only members of the organization that owns the repository, set `member
 | `max-previous-findings-chars` | `60000` | Room for earlier findings and the replies in their resolved threads, so they are not raised again; pr-agent's own default is 8000, and `0` turns it off |
 | `result-comment` | `true` | Keep one comment with what the bot decided and why |
 | `converge` | `true` | After the first review, block only on findings on code changed since the last review and on the bot's own open threads |
-| `max-blocking-reviews` | `3` | How many reviews of one pull request can block on the model's findings; later ones only post them. `0` means no limit |
+| `max-blocking-reviews` | `3` | How many reviews of one pull request can block on the model's findings and merge recommendation; later ones only post them. `0` means no limit |
 | `max-blocking-findings` | `3` | How many findings in one review can block approval, in the model's order; the rest are posted and listed as not blocking. `0` means no limit |
 | `resolve-fixed-threads` | `true` | Resolve the bot's threads whose lines a later commit changed, when the new review raised nothing there again |
 | `review-on` | `push` | `push` reviews every commit; `label` reviews new commits only when the review label is added (see [Review on request](#review-on-request)) |

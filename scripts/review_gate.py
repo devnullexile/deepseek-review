@@ -105,14 +105,15 @@ def _security_concern(value):
     return str(value).strip().lower() not in NEGATIVE_SECURITY_ANSWERS
 
 
-def approval_blockers(output, blocking_issues=None, *, review_excluded=(), max_findings=0):
+def approval_blockers(output, blocking_issues=None, *, review_excluded=(), max_findings=0, capped=False):
     """Return reasons that prevent approval; an empty list means approve.
 
     The check fails closed: anything missing or unexpected blocks approval. With
     blocking_issues (a later review that converges), only those findings block, and the merge
     recommendation is advisory when the review has findings and none of them blocks. A finding on
     a path left out of the review, or one phrased as a question, never blocks. When max_findings is
-    set, only that many findings block, in the model's order.
+    set, only that many findings block, in the model's order. capped says that the review limit
+    (max-blocking-reviews) was reached: the model's verdict is then advisory even with no finding.
     """
     if not isinstance(output, dict) or not isinstance(output.get("review"), dict):
         return ["review output is missing or malformed"]
@@ -145,8 +146,9 @@ def approval_blockers(output, blocking_issues=None, *, review_excluded=(), max_f
         elif blocking:
             blockers.append(f"merge recommendation is {recommendation!r}")
             blockers.append(f"{len(blocking)} finding(s) on lines changed since the last review")
-        elif not issues and recommendation != "no_concerns_found":
-            # With no finding at all the verdict is the only signal, so it still blocks.
+        elif not issues and recommendation != "no_concerns_found" and not capped:
+            # With no finding at all the verdict is the only signal, so it still blocks, until the
+            # review limit makes the model's judgement advisory.
             blockers.append(f"merge recommendation is {recommendation!r}")
 
     if _security_concern(review.get("security_concerns")):
@@ -936,7 +938,7 @@ def decision_blockers(client, review, excluded_patterns=(), *, converge=None, to
         return [f"earlier findings could not be checked ({converge['error']})"]
     blocking = converge.get("blocking") if converge else None
     blockers = approval_blockers(review, blocking, review_excluded=review_excluded,
-                                 max_findings=max_findings)
+                                 max_findings=max_findings, capped=bool(converge and converge.get("capped")))
     if converge and converge.get("earlier"):
         blockers.append(f"{len(converge['earlier'])} earlier finding(s) of the bot are not resolved")
     if too_large:

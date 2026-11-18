@@ -315,6 +315,20 @@ class LoopCommandTests(ApiTestCase):
         self.assertIn("Approval result: approved", result.stdout)
         self.assertIn("max-blocking-reviews", fake.comments[0]["body"])
 
+    def test_after_the_last_blocking_review_a_verdict_without_findings_no_longer_blocks(self):
+        fake = self.start()
+        self.comment(fake, reviews=3)
+        result = self.approve(fake, review_of(recommendation="needs_review"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Approval result: approved", result.stdout)
+
+    def test_before_the_limit_a_verdict_without_findings_still_blocks(self):
+        fake = self.start()
+        self.comment(fake, reviews=1)
+        result = self.approve(fake, review_of(recommendation="needs_review"))
+        self.assertNotIn("Approval result: approved", result.stdout)
+        self.assertIn("merge recommendation is 'needs_review'", fake.comments[0]["body"])
+
     def test_the_limit_can_be_turned_off(self):
         fake = self.start()
         self.comment(fake, reviews=3)
